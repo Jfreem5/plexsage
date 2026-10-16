@@ -621,6 +621,7 @@ async function updateFilterPreview() {
                 max_tracks_to_ai: state.maxTracksToAI,
                 min_rating: state.minRating,
                 exclude_live: state.excludeLive,
+                prompt: state.prompt || null,
             }),
         });
 
@@ -683,6 +684,14 @@ function updateFilterPreviewDisplay(matchingTracks, tracksToSend, estimatedCost)
 function recalculateCostDisplay() {
     // Recalculate cost locally without API call (for track_count/max_tracks changes)
     if (!state.lastFilterPreview || !state.config) return;
+
+    // A prompt makes the AI track budget dynamic (see the backend
+    // compute_track_budget heuristic), which can't be mirrored locally, so
+    // fall back to the API for an accurate count/cost.
+    if (state.prompt) {
+        updateFilterPreview();
+        return;
+    }
 
     // If cost rates aren't available (old config), fall back to API call
     if (state.config.cost_per_million_input === undefined) {

@@ -197,6 +197,7 @@ class FilterPreviewRequest(BaseModel):
     max_tracks_to_ai: int = 500  # 0 = no limit
     min_rating: int = 0  # 0 = any, 2/4/6/8/10 = minimum rating (Plex uses 0-10)
     exclude_live: bool = True
+    prompt: str | None = None  # Used to size the dynamic AI track budget
 
 
 class FilterPreviewResponse(BaseModel):

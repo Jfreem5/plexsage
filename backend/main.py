@@ -1,6 +1,8 @@
 """FastAPI application for PlexSage."""
 
 import asyncio
+import contextlib
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,6 +34,7 @@ from backend.models import (
     UpdateConfigRequest,
 )
 from backend.plex_client import get_plex_client, init_plex_client
+from backend.track_db import SYNC_INTERVAL_SECONDS, get_track_db, init_track_db
 from backend.llm_client import (
     get_llm_client,
     init_llm_client,
@@ -44,7 +47,29 @@ from backend.llm_client import (
 )
 from backend.models import OllamaModelsResponse, OllamaModelInfo, OllamaStatus
 from backend.analyzer import analyze_prompt as do_analyze_prompt, analyze_track as do_analyze_track
-from backend.generator import generate_playlist as do_generate_playlist, generate_playlist_stream
+from backend.generator import generate_playlist as do_generate_playlist, generate_playlist_stream, compute_track_budget
+
+logger = logging.getLogger(__name__)
+
+
+async def _periodic_track_db_sync() -> None:
+    """Keep the local TrackDB mirrored to Plex on a schedule.
+
+    Runs an initial sync immediately, then re-syncs every
+    ``SYNC_INTERVAL_SECONDS`` so reads can be served from SQLite.
+    """
+    while True:
+        try:
+            plex_client = get_plex_client()
+            if plex_client and plex_client.is_connected():
+                synced = await asyncio.to_thread(plex_client.sync_track_db)
+                if synced:
+                    logger.info("TrackDB background sync: %d tracks", synced)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("TrackDB background sync failed")
+        await asyncio.sleep(SYNC_INTERVAL_SECONDS)
 
 
 @asynccontextmanager
@@ -377,13 +402,19 @@ async def preview_filters(request: FilterPreviewRequest) -> FilterPreviewRespons
         min_rating=min_rating,
     )
 
-    # Calculate how many tracks will actually be sent to AI
+    # Calculate how many tracks will actually be sent to AI. This uses the same
+    # dynamic budget as generation, so the preview matches the real request.
     if matching_tracks <= 0:
         tracks_to_send = 0
-    elif request.max_tracks_to_ai == 0:  # No limit
-        tracks_to_send = matching_tracks
     else:
-        tracks_to_send = min(matching_tracks, request.max_tracks_to_ai)
+        tracks_to_send = compute_track_budget(
+            prompt=request.prompt,
+            requested_max=request.max_tracks_to_ai,
+            track_count=request.track_count,
+            pool_size=matching_tracks,
+            genres=genres,
+            decades=decades,
+        )
 
     # Estimate tokens for the generation request
     # Rough estimates: ~50 tokens per track in context, ~30 tokens per track in output
