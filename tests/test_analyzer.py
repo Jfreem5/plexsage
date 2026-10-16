@@ -281,7 +281,21 @@ class TestTrackAnalysis:
 
 
 class TestTrackAnalysisCache:
-    """analyze_track() should reuse cached dimensions per track/model."""
+    """analyze_track() should reuse cached dimensions per track/model.
+
+    The cache lives in the shared local library database; each test gets a
+    throwaway database so cache state never leaks between tests.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _temp_library_db(self, tmp_path, monkeypatch):
+        from backend import library_cache
+
+        monkeypatch.setattr(library_cache, "DB_PATH", tmp_path / "analyzer.db")
+        monkeypatch.setattr(library_cache, "DATA_DIR", tmp_path)
+        # Reset the once-per-process schema flag so the temp DB is created.
+        monkeypatch.setattr(library_cache, "_schema_initialized", False)
+        yield
 
     def _track(self, **overrides):
         from backend.models import Track
@@ -330,18 +344,15 @@ class TestTrackAnalysisCache:
         client.parse_json_response.return_value = json.loads(self._llm_response().content)
         return client
 
-    def test_second_analysis_hits_cache(self, tmp_path):
+    def test_second_analysis_hits_cache(self):
         """Same track + same model should not call the LLM twice."""
         from backend.analyzer import analyze_track
-        from backend.track_db import TrackDB
 
-        db = TrackDB(tmp_path / "analyzer.db")
         client = self._mock_llm()
 
         with patch("backend.analyzer.get_llm_client", return_value=client):
-            with patch("backend.analyzer.get_track_db", return_value=db):
-                first = analyze_track(self._track())
-                second = analyze_track(self._track())
+            first = analyze_track(self._track())
+            second = analyze_track(self._track())
 
         assert first.cached is False
         assert first.token_count > 0
@@ -351,82 +362,69 @@ class TestTrackAnalysisCache:
         assert [d.id for d in second.dimensions] == [d.id for d in first.dimensions]
         assert client.analyze.call_count == 1
 
-    def test_model_change_invalidates_cache(self, tmp_path):
+    def test_model_change_invalidates_cache(self):
         """Switching analysis models must re-analyze the track."""
         from backend.analyzer import analyze_track
-        from backend.track_db import TrackDB
-
-        db = TrackDB(tmp_path / "analyzer.db")
 
         client_a = self._mock_llm(model="model-a")
         with patch("backend.analyzer.get_llm_client", return_value=client_a):
-            with patch("backend.analyzer.get_track_db", return_value=db):
-                analyze_track(self._track())
+            analyze_track(self._track())
 
         client_b = self._mock_llm(model="model-b")
         with patch("backend.analyzer.get_llm_client", return_value=client_b):
-            with patch("backend.analyzer.get_track_db", return_value=db):
-                result = analyze_track(self._track())
+            result = analyze_track(self._track())
 
         assert client_a.analyze.call_count == 1
         assert client_b.analyze.call_count == 1
         assert result.cached is False
 
-    def test_metadata_change_invalidates_cache(self, tmp_path):
+    def test_metadata_change_invalidates_cache(self):
         """Changed track metadata must re-analyze (fingerprint mismatch)."""
         from backend.analyzer import analyze_track
-        from backend.track_db import TrackDB
 
-        db = TrackDB(tmp_path / "analyzer.db")
         client = self._mock_llm()
 
         with patch("backend.analyzer.get_llm_client", return_value=client):
-            with patch("backend.analyzer.get_track_db", return_value=db):
-                analyze_track(self._track())
-                result = analyze_track(self._track(album="A Different Album"))
+            analyze_track(self._track())
+            result = analyze_track(self._track(album="A Different Album"))
 
         assert client.analyze.call_count == 2
         assert result.cached is False
 
-    def test_cache_does_not_apply_without_database(self):
-        """With no DB configured, analysis behaves exactly as before."""
+    def test_cache_failure_falls_back_to_llm(self):
+        """If the cache store is unavailable, analysis still works."""
         from backend.analyzer import analyze_track
 
         client = self._mock_llm()
         with patch("backend.analyzer.get_llm_client", return_value=client):
-            with patch("backend.analyzer.get_track_db", return_value=None):
-                analyze_track(self._track())
-                analyze_track(self._track())
+            with patch("backend.library_cache.get_dimensions", side_effect=RuntimeError("no db")):
+                with patch("backend.library_cache.save_dimensions", side_effect=RuntimeError("no db")):
+                    analyze_track(self._track())
+                    analyze_track(self._track())
 
         assert client.analyze.call_count == 2
 
-    def test_use_cache_disabled_bypasses_cache(self, tmp_path):
+    def test_use_cache_disabled_bypasses_cache(self):
         """use_cache=False forces a fresh LLM call even on a cache hit."""
         from backend.analyzer import analyze_track
-        from backend.track_db import TrackDB
 
-        db = TrackDB(tmp_path / "analyzer.db")
         client = self._mock_llm()
 
         with patch("backend.analyzer.get_llm_client", return_value=client):
-            with patch("backend.analyzer.get_track_db", return_value=db):
-                analyze_track(self._track())
-                analyze_track(self._track(), use_cache=False)
+            analyze_track(self._track())
+            analyze_track(self._track(), use_cache=False)
 
         assert client.analyze.call_count == 2
 
-    def test_cached_dimensions_reconstruct_models(self, tmp_path):
+    def test_cached_dimensions_reconstruct_models(self):
         """Cached JSON should rebuild valid Dimension models."""
         from backend.analyzer import analyze_track
-        from backend.track_db import TrackDB
 
-        db = TrackDB(tmp_path / "analyzer.db")
         client = self._mock_llm()
 
         with patch("backend.analyzer.get_llm_client", return_value=client):
-            with patch("backend.analyzer.get_track_db", return_value=db):
-                analyze_track(self._track())
-                second = analyze_track(self._track())
+            analyze_track(self._track())
+            second = analyze_track(self._track())
 
         assert [d.id for d in second.dimensions] == ["mood", "era"]
         assert second.dimensions[0].label == "Melancholy, bittersweet mood"

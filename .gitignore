@@ -46,11 +46,13 @@ htmlcov/
 
 # Development tools
 .claude/
+.playwright-cli/
 .specify/
 specs/
 initial-spec.md
 CLAUDE.md
 CODE_REVIEW.md
+docs/plans/
 
 # OS
 .DS_Store
@@ -67,7 +69,7 @@ config.user.yaml
 *.log
 logs/
 
-# Local SQLite track database
+# Local SQLite databases (library cache, dimension cache)
 *.db
 *.db-wal
 *.db-shm
@@ -80,8 +82,14 @@ logs/
 .env.local
 *.local
 
+# Database files
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
 # Temporary files
 tmp/
 temp/
 *.tmp
 .archive/
+specs/

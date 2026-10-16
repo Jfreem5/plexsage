@@ -3,58 +3,247 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PlexSage</title>
+    <title>MediaSage</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+    <a href="#main-content" class="skip-link">Skip to main content</a>
     <div class="app">
         <!-- Header -->
         <header class="header">
-            <h1 class="logo">PlexSage</h1>
+            <h1 class="logo"><a href="#home" class="logo-link">MediaSage</a></h1>
             <nav class="nav" role="navigation" aria-label="Main navigation">
-                <button class="nav-btn active" data-view="create" aria-selected="true">Create</button>
-                <button class="nav-btn" data-view="settings" aria-selected="false">Settings</button>
+                <div class="nav-dropdown">
+                    <button class="nav-dropdown-trigger" aria-expanded="false" aria-haspopup="true">
+                        Make Playlist <span class="nav-chevron" aria-hidden="true">&#9662;</span>
+                    </button>
+                    <div class="nav-dropdown-menu" role="menu">
+                        <button class="nav-dropdown-item" role="menuitem" data-nav="playlist-prompt">
+                            <span class="nav-check" aria-hidden="true"></span> From Prompt
+                        </button>
+                        <button class="nav-dropdown-item" role="menuitem" data-nav="playlist-seed">
+                            <span class="nav-check" aria-hidden="true"></span> From Seed Song
+                        </button>
+                    </div>
+                </div>
+                <button class="nav-btn" data-nav="recommend-album" aria-current="false">Recommend Album</button>
+                <button class="nav-btn nav-btn--icon" data-nav="settings" aria-current="false" aria-label="Settings"><svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
             </nav>
         </header>
 
         <!-- Main Content -->
-        <main class="main">
-            <!-- Create View -->
-            <div id="create-view" class="view active">
-                <!-- Mode Selection -->
-                <div class="mode-tabs" role="tablist" aria-label="Playlist creation mode">
-                    <button class="mode-tab active" data-mode="prompt" role="tab" aria-selected="true">
-                        <span class="mode-icon" aria-hidden="true">💭</span>
-                        <span class="mode-label">Prompt</span>
-                    </button>
-                    <button class="mode-tab" data-mode="seed" role="tab" aria-selected="false">
-                        <span class="mode-icon" aria-hidden="true">🎵</span>
-                        <span class="mode-label">Seed Track</span>
-                    </button>
+        <main class="main" id="main-content">
+            <!-- Home View -->
+            <div id="home-view" class="view">
+                <!-- Initial loading spinner (hidden once app initializes) -->
+                <div id="app-loading" class="app-loading" aria-label="Loading">
+                    <div class="spinner"></div>
                 </div>
 
+                <!-- Setup Wizard (shown on first launch) -->
+                <div id="setup-wizard" class="setup-wizard hidden">
+                    <div class="setup-header">
+                        <h2 class="setup-title">Welcome to MediaSage</h2>
+                        <p class="setup-subtitle">Let's get you set up. This should only take a minute.</p>
+                    </div>
+
+                    <!-- Data directory warning (blocking) -->
+                    <div id="setup-data-warning" class="setup-warning hidden" role="alert">
+                        <div class="setup-warning-icon" aria-hidden="true">!</div>
+                        <div class="setup-warning-text">
+                            <strong>Data directory is not writable</strong>
+                            <p>MediaSage cannot write to its data directory. This is usually a Docker volume permissions issue.</p>
+                            <p id="setup-data-fix" class="setup-warning-fix"></p>
+                        </div>
+                    </div>
+
+                    <!-- Step 1: Plex -->
+                    <div class="setup-step" id="setup-step-plex">
+                        <div class="setup-step-header">
+                            <span class="setup-step-number">1</span>
+                            <div class="setup-step-title">
+                                <h3>Connect to Plex</h3>
+                                <span class="setup-step-status" id="setup-plex-status"></span>
+                            </div>
+                        </div>
+                        <div class="setup-step-body" id="setup-plex-body">
+                            <div class="setup-step-form" id="setup-plex-form">
+                                <div class="form-group">
+                                    <label for="setup-plex-url">Plex Server URL</label>
+                                    <input type="text" id="setup-plex-url" placeholder="http://your-plex-server:32400">
+                                </div>
+                                <div class="form-group">
+                                    <label for="setup-plex-token">Plex Token</label>
+                                    <input type="password" id="setup-plex-token" placeholder="Your Plex token">
+                                    <p class="setup-field-hint">Find your token: <a href="https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/" target="_blank" rel="noopener">Plex support article</a></p>
+                                </div>
+                                <div class="form-group">
+                                    <label for="setup-plex-library">Music Library</label>
+                                    <input type="text" id="setup-plex-library" value="Music" placeholder="Music library name">
+                                </div>
+                                <div id="setup-plex-error" class="setup-inline-error hidden" role="alert"></div>
+                                <button id="setup-plex-btn" class="btn btn-primary">Connect</button>
+                            </div>
+                            <div class="setup-step-done hidden" id="setup-plex-done">
+                                <span class="setup-done-icon" aria-hidden="true">&#10003;</span>
+                                <span class="setup-done-text" id="setup-plex-done-text">Connected</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Step 2: AI Provider -->
+                    <div class="setup-step" id="setup-step-ai">
+                        <div class="setup-step-header">
+                            <span class="setup-step-number">2</span>
+                            <div class="setup-step-title">
+                                <h3>Configure AI Provider</h3>
+                                <span class="setup-step-status" id="setup-ai-status"></span>
+                            </div>
+                        </div>
+                        <div class="setup-step-body" id="setup-ai-body">
+                            <div class="setup-step-form" id="setup-ai-form">
+                                <div class="form-group">
+                                    <label for="setup-ai-provider">Provider</label>
+                                    <select id="setup-ai-provider">
+                                        <option value="gemini">Google Gemini</option>
+                                        <option value="anthropic">Anthropic (Claude)</option>
+                                        <option value="openai">OpenAI (GPT)</option>
+                                        <option value="ollama">Ollama (Local)</option>
+                                        <option value="custom">Custom (OpenAI-compatible)</option>
+                                    </select>
+                                </div>
+                                <div class="form-group" id="setup-ai-key-group">
+                                    <label for="setup-ai-key">API Key</label>
+                                    <input type="password" id="setup-ai-key" placeholder="Your API key">
+                                    <p class="setup-field-hint" id="setup-ai-hint">Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a></p>
+                                </div>
+                                <div class="form-group hidden" id="setup-ai-ollama-group">
+                                    <label for="setup-ai-ollama-url">Ollama URL</label>
+                                    <input type="text" id="setup-ai-ollama-url" placeholder="http://localhost:11434" value="http://localhost:11434">
+                                </div>
+                                <div class="form-group hidden" id="setup-ai-custom-group">
+                                    <label for="setup-ai-custom-url">API Base URL</label>
+                                    <input type="text" id="setup-ai-custom-url" placeholder="http://localhost:5000/v1">
+                                </div>
+                                <div id="setup-ai-error" class="setup-inline-error hidden" role="alert"></div>
+                                <button id="setup-ai-btn" class="btn btn-primary">Validate</button>
+                            </div>
+                            <div class="setup-step-done hidden" id="setup-ai-done">
+                                <span class="setup-done-icon" aria-hidden="true">&#10003;</span>
+                                <span class="setup-done-text" id="setup-ai-done-text">Configured</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Step 3: Library Sync -->
+                    <div class="setup-step" id="setup-step-sync">
+                        <div class="setup-step-header">
+                            <span class="setup-step-number">3</span>
+                            <div class="setup-step-title">
+                                <h3>Sync Your Library</h3>
+                                <span class="setup-step-status" id="setup-sync-status"></span>
+                            </div>
+                        </div>
+                        <div class="setup-step-body" id="setup-sync-body">
+                            <div class="setup-step-form" id="setup-sync-form">
+                                <div id="setup-sync-error" class="setup-inline-error hidden" role="alert"></div>
+                                <p class="setup-step-info" id="setup-sync-waiting">Complete steps 1 and 2 first.</p>
+                                <div id="setup-sync-progress-wrap" class="hidden">
+                                    <p class="setup-step-info" id="setup-sync-message">Syncing your library...</p>
+                                    <div class="sync-progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100" aria-label="Library sync progress">
+                                        <div id="setup-sync-progress-fill" class="sync-progress-fill"></div>
+                                    </div>
+                                    <p id="setup-sync-progress-text" class="sync-progress-text">Starting...</p>
+                                </div>
+                            </div>
+                            <div class="setup-step-done hidden" id="setup-sync-done">
+                                <span class="setup-done-icon" aria-hidden="true">&#10003;</span>
+                                <span class="setup-done-text" id="setup-sync-done-text">Synced</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Step 4: Get Started -->
+                    <div class="setup-step" id="setup-step-ready">
+                        <div class="setup-step-header">
+                            <span class="setup-step-number">4</span>
+                            <div class="setup-step-title">
+                                <h3>You're all set!</h3>
+                                <span class="setup-step-status" id="setup-ready-status"></span>
+                            </div>
+                        </div>
+                        <div class="setup-step-body">
+                            <button id="setup-get-started-btn" class="btn btn-primary" disabled>Get Started</button>
+                        </div>
+                    </div>
+
+                    <div class="setup-footer">
+                        <button id="setup-skip-btn" class="btn-link setup-skip-link">Skip Setup</button>
+                    </div>
+                </div>
+
+                <div class="home-content home-content--loading">
+                    <h2 class="home-greeting">What do you want to listen to?</h2>
+                    <p class="home-subtitle">Create playlists and discover albums from your library.</p>
+                    <div class="home-cards">
+                        <button class="home-card" data-nav="playlist-prompt">
+                            <div class="home-card-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 18V5"/><path d="M15 13a4.17 4.17 0 0 1-3-4 4.17 4.17 0 0 1-3 4"/><path d="M17.598 6.5A3 3 0 1 0 12 5a3 3 0 1 0-5.598 1.5"/><path d="M17.997 5.125a4 4 0 0 1 2.526 5.77"/><path d="M18 18a4 4 0 0 0 2-7.464"/><path d="M19.967 17.483A4 4 0 1 1 12 18a4 4 0 1 1-7.967-.517"/><path d="M6 18a4 4 0 0 1-2-7.464"/><path d="M6.003 5.125a4 4 0 0 0-2.526 5.77"/></svg></div>
+                            <div class="home-card-text">
+                                <div class="home-card-title">Playlist from Prompt</div>
+                                <div class="home-card-desc">Describe a vibe and let AI curate tracks</div>
+                            </div>
+                        </button>
+                        <button class="home-card" data-nav="playlist-seed">
+                            <div class="home-card-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 9.536V7a4 4 0 0 1 4-4h1.5a.5.5 0 0 1 .5.5V5a4 4 0 0 1-4 4 4 4 0 0 0-4 4c0 2 1 3 1 5a5 5 0 0 1-1 3"/><path d="M4 9a5 5 0 0 1 8 4 5 5 0 0 1-8-4"/><path d="M5 21h14"/></svg></div>
+                            <div class="home-card-text">
+                                <div class="home-card-title">Playlist from Seed</div>
+                                <div class="home-card-desc">Start from a song you love</div>
+                            </div>
+                        </button>
+                        <button class="home-card" data-nav="recommend-album">
+                            <div class="home-card-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="2"/></svg></div>
+                            <div class="home-card-text">
+                                <div class="home-card-title">Recommend Album</div>
+                                <div class="home-card-desc">Find the perfect album for the moment</div>
+                            </div>
+                        </button>
+                    </div>
+                    <div class="home-history">
+                        <h3 class="home-history-header">Recent activity</h3>
+                        <div id="history-feed" class="history-feed"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Create View -->
+            <div id="create-view" class="view">
                 <!-- Step Progress -->
-                <div class="step-progress" role="navigation" aria-label="Playlist creation steps">
+                <div id="playlist-steps" class="step-progress" role="navigation" aria-label="Playlist creation steps">
                     <div class="step active" data-step="input" aria-current="step">
-                        <span class="step-number">1</span>
-                        <span class="step-label">Input</span>
+                        <span class="step-circle">1</span>
+                        <span class="step-label" id="step-label-input">Prompt</span>
+                    </div>
+                    <div class="step-connector" aria-hidden="true"></div>
+                    <div class="step" data-step="refine">
+                        <span class="step-circle">2</span>
+                        <span class="step-label">Refine</span>
                     </div>
                     <div class="step-connector" aria-hidden="true"></div>
                     <div class="step" data-step="dimensions">
-                        <span class="step-number">2</span>
+                        <span class="step-circle">2</span>
                         <span class="step-label">Dimensions</span>
                     </div>
                     <div class="step-connector" aria-hidden="true"></div>
                     <div class="step" data-step="filters">
-                        <span class="step-number">3</span>
+                        <span class="step-circle">3</span>
                         <span class="step-label">Filters</span>
                     </div>
                     <div class="step-connector" aria-hidden="true"></div>
                     <div class="step" data-step="results">
-                        <span class="step-number">4</span>
+                        <span class="step-circle">4</span>
                         <span class="step-label">Results</span>
                     </div>
                 </div>
@@ -72,12 +261,27 @@
                             rows="4"
                             aria-label="Playlist description"
                         ></textarea>
+                        <div class="example-prompts">
+                            <div class="example-prompts-header">
+                                <p class="example-prompts-label">Or try one of these</p>
+                                <button id="playlist-prompt-shuffle" class="prompt-shuffle" aria-label="Show different suggestions" title="Show different suggestions">&#x21bb;</button>
+                            </div>
+                            <div id="playlist-prompt-pills" class="prompt-pills"></div>
+                        </div>
                         <button id="analyze-prompt-btn" class="btn btn-primary">
                             Analyze
                         </button>
                         <p id="llm-required-hint-prompt" class="llm-required-hint" hidden>
                             <a href="#" data-view="settings">Configure an LLM provider</a> to continue
                         </p>
+                    </div>
+
+                    <!-- Refine Step (Prompt Mode Only) -->
+                    <div id="step-refine" class="step-panel">
+                        <h2>Just a couple questions</h2>
+                        <p class="step-description">Help us narrow it down. Skip any you're not sure about.</p>
+                        <div id="playlist-questions-container" class="questions-container"></div>
+                        <button id="refine-next-btn" class="btn btn-primary">Next</button>
                     </div>
 
                     <!-- Input Step (Seed Mode) -->
@@ -128,18 +332,21 @@
                         <h2>Filter your library</h2>
                         <p class="step-description">Select genres and decades to narrow down the tracks sent to the AI. Smaller pools mean lower costs and more focused results.</p>
 
-                        <div id="filter-preview" class="filter-preview">
-                            <span id="preview-tracks" class="preview-stat">-- matching tracks</span>
-                            <span id="preview-cost" class="preview-stat">Est. cost: --</span>
-                        </div>
-
                         <div class="filter-section">
-                            <h3>Genres</h3>
+                            <div class="filter-section-header">
+                                <h3>Genres</h3>
+                                <button id="genre-toggle-all" class="filter-toggle-all"
+                                        aria-label="Select all genres">Select All</button>
+                            </div>
                             <div id="genre-chips" class="chip-container" role="group" aria-label="Genre filters"></div>
                         </div>
 
                         <div class="filter-section">
-                            <h3>Decades</h3>
+                            <div class="filter-section-header">
+                                <h3>Decades</h3>
+                                <button id="decade-toggle-all" class="filter-toggle-all"
+                                        aria-label="Select all decades">Select All</button>
+                            </div>
                             <div id="decade-chips" class="chip-container" role="group" aria-label="Decade filters"></div>
                         </div>
 
@@ -148,21 +355,9 @@
                             <div class="track-count-selector" role="group" aria-label="Playlist size">
                                 <button class="count-btn" data-count="15" aria-pressed="false">15</button>
                                 <button class="count-btn active" data-count="25" aria-pressed="true">25</button>
-                                <button class="count-btn" data-count="40" aria-pressed="false">40</button>
+                                <button class="count-btn" data-count="50" aria-pressed="false">50</button>
+                                <button class="count-btn" data-count="100" aria-pressed="false">100</button>
                             </div>
-                        </div>
-
-                        <div class="filter-section">
-                            <h3>Max Tracks to AI</h3>
-                            <p class="filter-hint">Limit how many tracks are sent to the AI for selection. Higher = better variety but more cost.</p>
-                            <div class="track-limit-selector" role="group" aria-label="Maximum tracks to send to AI">
-                                <button class="limit-btn" data-limit="100" aria-pressed="false">100</button>
-                                <button class="limit-btn" data-limit="250" aria-pressed="false">250</button>
-                                <button class="limit-btn active" data-limit="500" aria-pressed="true">500</button>
-                                <button class="limit-btn" data-limit="1000" aria-pressed="false">1000</button>
-                                <button class="limit-btn" data-limit="0" aria-pressed="false">No limit</button>
-                            </div>
-                            <p id="gemini-suggestion" class="filter-hint gemini-suggestion hidden"></p>
                         </div>
 
                         <div class="filter-section">
@@ -183,6 +378,24 @@
                             </div>
                         </div>
 
+                        <div class="filter-section">
+                            <h3>Max Tracks to AI</h3>
+                            <p class="filter-hint">Limit how many tracks are sent to the AI for selection. Higher = better variety but more cost.</p>
+                            <div class="track-limit-selector" role="group" aria-label="Maximum tracks to send to AI">
+                                <button class="limit-btn" data-limit="100" aria-pressed="false">100</button>
+                                <button class="limit-btn" data-limit="250" aria-pressed="false">250</button>
+                                <button class="limit-btn active" data-limit="500" aria-pressed="true">500</button>
+                                <button class="limit-btn" data-limit="1000" aria-pressed="false">1000</button>
+                                <button class="limit-btn" data-limit="0" aria-pressed="false">No limit</button>
+                            </div>
+                            <p id="gemini-suggestion" class="filter-hint gemini-suggestion hidden"></p>
+                        </div>
+
+                        <div id="filter-preview" class="filter-preview">
+                            <span id="preview-tracks" class="preview-stat">-- matching tracks</span>
+                            <span id="preview-cost" class="preview-stat">Est. cost: --</span>
+                        </div>
+
                         <button id="generate-btn" class="btn btn-primary">
                             Generate Playlist
                         </button>
@@ -190,28 +403,69 @@
 
                     <!-- Results Step -->
                     <div id="step-results" class="step-panel">
-                        <div class="results-header">
-                            <h2>Your Playlist</h2>
-                            <div class="cost-display" id="cost-display"></div>
+                        <button id="back-to-filters-btn" class="results-back-link">&larr; Back to filters</button>
+
+                        <div class="results-grid">
+                            <div class="results-header-left">
+                                <div class="playlist-name-container">
+                                    <input
+                                        type="text"
+                                        id="playlist-name-input"
+                                        class="playlist-name-input"
+                                        placeholder="Enter playlist name..."
+                                        aria-label="Playlist name"
+                                    >
+                                </div>
+                                <div id="playlist-picker-container" class="playlist-picker-container hidden">
+                                    <select id="playlist-picker" class="playlist-picker-select" aria-label="Select playlist to update">
+                                        <option value="__scratch__">MediaSage - Now Playing</option>
+                                    </select>
+                                </div>
+                                <div id="narrative-box" class="narrative-box hidden"></div>
+                                <div class="results-header-meta">
+                                    <span id="results-track-count" class="meta-pill"></span>
+                                    <span id="results-prompt-pill" class="prompt-pill hidden"></span>
+                                </div>
+                            </div>
+                            <div class="results-sidebar">
+                                <div class="results-header-actions">
+                                    <div class="split-button-group">
+                                        <button id="save-playlist-btn" class="btn btn-primary split-button-main">
+                                            <span class="btn-label-long">Save to Plex</span><span class="btn-label-short">Save</span>
+                                        </button>
+                                        <button id="save-mode-dropdown-btn" class="btn btn-primary split-button-arrow" aria-label="Save mode options" aria-expanded="false">
+                                            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 5L6 8L9 5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                                        </button>
+                                        <div id="save-mode-dropdown" class="save-mode-dropdown hidden" role="menu">
+                                            <button class="save-mode-option active" data-mode="new" role="menuitem">
+                                                <span class="save-mode-check">&#10003;</span> Save new playlist
+                                            </button>
+                                            <button class="save-mode-option" data-mode="replace" role="menuitem">
+                                                <span class="save-mode-check"></span> Replace a playlist
+                                            </button>
+                                            <button class="save-mode-option" data-mode="append" role="menuitem">
+                                                <span class="save-mode-check"></span> Append to a playlist
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <button id="play-now-btn" class="btn btn-secondary btn-play-now">
+                                        &#9654; Play Now
+                                    </button>
+                                    <button id="playlist-start-over" class="rec-action-link rec-action-link--subtle">Start over</button>
+                                </div>
+                                <aside id="track-reason-panel" class="track-reason-panel">
+                                    <div class="reason-placeholder">Click a track to see why it was chosen</div>
+                                    <div class="reason-content hidden">
+                                        <div class="reason-album-art-container"></div>
+                                        <div class="reason-track-title"></div>
+                                        <div class="reason-track-artist"></div>
+                                        <p class="reason-text"></p>
+                                    </div>
+                                </aside>
+                            </div>
+                            <div id="playlist-tracks" class="playlist-tracks" role="listbox" aria-label="Generated playlist"></div>
                         </div>
-                        <div class="playlist-name-container">
-                            <input
-                                type="text"
-                                id="playlist-name-input"
-                                class="playlist-name-input"
-                                placeholder="Enter playlist name..."
-                                aria-label="Playlist name"
-                            >
-                        </div>
-                        <div id="playlist-tracks" class="playlist-tracks" role="list" aria-label="Generated playlist"></div>
-                        <div class="results-actions">
-                            <button id="regenerate-btn" class="btn btn-secondary">
-                                Regenerate
-                            </button>
-                            <button id="save-playlist-btn" class="btn btn-primary">
-                                Save to Plex
-                            </button>
-                        </div>
+
                     </div>
                 </div>
 
@@ -227,15 +481,158 @@
                 <!-- Success Modal -->
                 <div id="success-modal" class="success-modal hidden" role="dialog" aria-modal="true" aria-labelledby="success-modal-title">
                     <div class="success-modal-content">
+                        <button class="modal-close" onclick="dismissSuccessModal()" aria-label="Close">&times;</button>
                         <div class="success-icon" aria-hidden="true"></div>
                         <h2 id="success-modal-title">Playlist Saved!</h2>
                         <p id="success-modal-summary"></p>
                         <div class="success-modal-actions">
                             <a id="open-in-plex-btn" class="btn btn-plex" href="#" target="_blank" rel="noopener">Open in Plex <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h6"/><path d="m21 3-9 9"/><path d="M15 3h6v6"/></svg></a>
                             <button id="new-playlist-btn" class="btn btn-primary">Start New Playlist</button>
+                            <button class="btn btn-secondary" onclick="dismissSuccessModal()">Back to Playlist</button>
                         </div>
                     </div>
                 </div>
+
+                <!-- Update Success Modal -->
+                <div id="update-success-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="update-success-title">
+                    <div class="modal-card modal-card--success">
+                        <button class="modal-close" onclick="dismissUpdateSuccess()" aria-label="Close">&times;</button>
+                        <div class="success-hero">
+                            <div class="success-ring" aria-hidden="true">
+                                <svg class="success-ring-svg" viewBox="0 0 48 48" fill="none">
+                                    <circle class="success-ring-bg" cx="24" cy="24" r="22" stroke-width="3"/>
+                                    <circle class="success-ring-progress" cx="24" cy="24" r="22" stroke-width="3"/>
+                                </svg>
+                                <div class="success-ring-icon">&#10003;</div>
+                            </div>
+                            <h2 id="update-success-title">Playlist Updated</h2>
+                        </div>
+                        <div class="success-details">
+                            <p id="update-success-message" class="success-detail-line"></p>
+                        </div>
+                        <div class="success-actions">
+                            <a id="update-open-in-plex-btn" class="btn btn-plex" href="#" target="_blank" rel="noopener">Open in Plex <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h6"/><path d="m21 3-9 9"/><path d="M15 3h6v6"/></svg></a>
+                            <button id="update-new-playlist-btn" class="btn btn-primary">New Playlist</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Recommend Album View -->
+            <div id="recommend-view" class="view">
+                <!-- 4-Step Progress Bar -->
+                <div id="rec-steps" class="step-progress" role="navigation" aria-label="Recommendation steps">
+                    <div class="step active" data-step="prompt">
+                        <span class="step-circle">1</span>
+                        <span class="step-label">Prompt</span>
+                    </div>
+                    <div class="step-connector"></div>
+                    <div class="step" data-step="refine">
+                        <span class="step-circle">2</span>
+                        <span class="step-label">Refine</span>
+                    </div>
+                    <div class="step-connector"></div>
+                    <div class="step" data-step="setup">
+                        <span class="step-circle">3</span>
+                        <span class="step-label">Filters</span>
+                    </div>
+                    <div class="step-connector"></div>
+                    <div class="step" data-step="results">
+                        <span class="step-circle">4</span>
+                        <span class="step-label">Results</span>
+                    </div>
+                </div>
+
+                <!-- Step Panels -->
+                <div class="rec-step-content">
+                    <!-- Prompt Step -->
+                    <div id="rec-step-prompt" class="rec-panel active">
+                        <h2>What are you in the mood for?</h2>
+                        <p class="step-description">Describe the vibe, moment, or feeling you want an album for.</p>
+                        <textarea id="rec-prompt-input" class="prompt-textarea" placeholder="e.g., something for a rainy Sunday morning..." rows="4" aria-label="Album recommendation prompt"></textarea>
+                        <div class="example-prompts">
+                            <div class="example-prompts-header">
+                                <p class="example-prompts-label">Or try one of these</p>
+                                <button id="rec-prompt-shuffle" class="prompt-shuffle" aria-label="Show different suggestions" title="Show different suggestions">&#x21bb;</button>
+                            </div>
+                            <div id="rec-prompt-pills" class="prompt-pills"></div>
+                        </div>
+                        <button id="rec-prompt-next" class="btn btn-primary">Next</button>
+                    </div>
+
+                    <!-- Refine Step (questions) -->
+                    <div id="rec-step-refine" class="rec-panel">
+                        <h2>Just a couple questions</h2>
+                        <p class="step-description">Help us narrow it down. Skip any you're not sure about.</p>
+                        <div id="rec-questions-container" class="questions-container"></div>
+                        <button id="rec-refine-next" class="btn btn-primary">Next</button>
+                    </div>
+
+                    <!-- Filters Step: Mode + Filters -->
+                    <div id="rec-step-setup" class="rec-panel">
+                        <p id="rec-filter-info" class="rec-filter-info hidden">Pre-selected based on your prompt. Adjust if needed.</p>
+                        <h2>Choose your mode</h2>
+                        <div class="rec-mode-control" role="group" aria-label="Recommendation mode">
+                            <button class="rec-mode-btn active" data-rec-mode="library" aria-pressed="true">From My Library</button>
+                            <button class="rec-mode-btn" data-rec-mode="discovery" aria-pressed="false">Something New</button>
+                        </div>
+                        <div class="rec-filters">
+                            <div class="filter-section">
+                                <div class="filter-section-header">
+                                    <h3>Genres</h3>
+                                    <button id="rec-genre-toggle-all" class="filter-toggle-all" aria-label="Select all genres">Select All</button>
+                                </div>
+                                <div id="rec-genre-chips" class="chip-container" role="group" aria-label="Genre filters"></div>
+                            </div>
+                            <div class="filter-section">
+                                <div class="filter-section-header">
+                                    <h3>Decades</h3>
+                                    <button id="rec-decade-toggle-all" class="filter-toggle-all" aria-label="Select all decades">Select All</button>
+                                </div>
+                                <div id="rec-decade-chips" class="chip-container" role="group" aria-label="Decade filters"></div>
+                            </div>
+                        </div>
+                        <div class="filter-section">
+                            <h3>Max Albums to AI</h3>
+                            <p class="filter-hint">Limit how many albums are sent to the AI for selection.</p>
+                            <div class="album-limit-selector" role="group" aria-label="Maximum albums to send to AI">
+                                <!-- populated dynamically by updateAlbumLimitButtons() -->
+                            </div>
+                            <p id="rec-gemini-suggestion" class="filter-hint gemini-suggestion hidden"></p>
+                        </div>
+                        <div id="rec-album-preview" class="rec-album-preview">
+                            <span id="rec-preview-count" class="preview-stat">-- albums</span>
+                            <span id="rec-preview-cost" class="preview-stat">Est. cost: --</span>
+                        </div>
+                        <div class="filter-section">
+                            <h3>Play History</h3>
+                            <div id="rec-familiarity-pills" class="chip-container" role="radiogroup" aria-label="Play history preference">
+                                <button class="chip selected" data-familiarity="any" role="radio" aria-checked="true">Any</button>
+                                <button class="chip" data-familiarity="comfort" role="radio" aria-checked="false">Comfort picks</button>
+                                <button class="chip" data-familiarity="rediscover" role="radio" aria-checked="false">Rediscover</button>
+                                <button class="chip" data-familiarity="hidden_gems" role="radio" aria-checked="false">Hidden gems</button>
+                            </div>
+                            <p class="rec-familiarity-hint">Influences which albums are suggested</p>
+                        </div>
+                        <button id="rec-setup-next" class="btn btn-primary">Next</button>
+                    </div>
+
+                    <!-- Results Step -->
+                    <div id="rec-step-results" class="rec-panel">
+                        <div id="rec-research-warning" class="rec-research-warning hidden">
+                            Research was unavailable — factual details could not be verified and may be approximate.
+                        </div>
+                        <div id="rec-primary-result" class="rec-primary-result"></div>
+                        <div id="rec-secondary-results" class="rec-secondary-results">
+                            <h3 class="rec-secondary-heading">Also worth exploring</h3>
+                            <div id="rec-secondary-cards" class="rec-secondary-cards"></div>
+                        </div>
+                        <div id="rec-discovery-bridge" class="rec-discovery-bridge hidden">
+                            <button id="rec-try-discovery" class="rec-discovery-link">Recommend something not in my library</button>
+                        </div>
+                    </div>
+                </div>
+
             </div>
 
             <!-- Settings View -->
@@ -294,7 +691,7 @@
                     <div id="ollama-settings" class="provider-settings hidden">
                         <div class="experimental-warning">
                             <strong>Experimental Feature</strong>
-                            <p>Local LLM support is experimental. Please <a href="https://github.com/ecwilsonaz/plexsage/issues" target="_blank" rel="noopener">report issues on GitHub</a>.</p>
+                            <p>Local LLM support is experimental. Please <a href="https://github.com/ecwilsonaz/mediasage/issues" target="_blank" rel="noopener">report issues on GitHub</a>.</p>
                         </div>
                         <div class="form-group">
                             <label for="ollama-url">Ollama URL</label>
@@ -327,7 +724,7 @@
                     <div id="custom-settings" class="provider-settings hidden">
                         <div class="experimental-warning">
                             <strong>Experimental Feature</strong>
-                            <p>Local LLM support is experimental. Please <a href="https://github.com/ecwilsonaz/plexsage/issues" target="_blank" rel="noopener">report issues on GitHub</a>.</p>
+                            <p>Local LLM support is experimental. Please <a href="https://github.com/ecwilsonaz/mediasage/issues" target="_blank" rel="noopener">report issues on GitHub</a>.</p>
                         </div>
                         <div class="form-group">
                             <label for="custom-url">API Base URL</label>
@@ -364,6 +761,119 @@
             </div>
         </main>
 
+        <!-- Sync Progress Modal (global – blocks UI for first-time and upgrade syncs) -->
+        <div id="sync-modal" class="sync-modal hidden" role="dialog" aria-modal="true" aria-labelledby="sync-modal-title">
+            <div class="sync-modal-content">
+                <h2 id="sync-modal-title"></h2>
+                <p id="sync-modal-description" class="sync-modal-description"></p>
+                <div class="sync-progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100" aria-label="Library sync progress">
+                    <div id="sync-progress-fill" class="sync-progress-fill"></div>
+                </div>
+                <p id="sync-progress-text" class="sync-progress-text">0 / 0 tracks</p>
+            </div>
+        </div>
+
+        <!-- Step-Based Loading Overlay (global – used by both playlist + album flows) -->
+        <div id="step-loading-overlay" class="step-loading-overlay hidden" role="status" aria-live="polite" aria-busy="true">
+            <div class="step-loading-content">
+                <div id="step-progress-list" class="step-progress-list"></div>
+            </div>
+        </div>
+
+        <!-- Client Picker Modal (global – used by both create and recommend views) -->
+        <div id="client-picker-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="client-picker-title">
+            <div class="modal-card">
+                <button class="modal-close" onclick="dismissClientPicker()" aria-label="Close">&times;</button>
+                <h2 id="client-picker-title">Select a Device</h2>
+                <p id="client-picker-hint" class="client-picker-hint hidden">
+                    <span class="hint-group"><span class="client-hint-dot playing"></span> Playing</span>
+                    <span class="hint-group"><span class="client-hint-dot"></span> Idle</span>
+                    <span class="hint-group"><span class="client-hint-dot mobile"></span> Needs active session</span>
+                </p>
+                <div id="client-list" class="client-list" role="listbox" aria-label="Available devices"></div>
+                <div id="client-empty-state" class="client-empty-state hidden">
+                    <p>No Plex clients active. Open Plexamp or Plex first.</p>
+                    <button id="refresh-clients-btn" class="btn btn-secondary">Refresh</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Play Mode Choice Modal -->
+        <div id="play-choice-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="play-choice-title">
+            <div class="modal-card">
+                <button class="modal-close" onclick="dismissPlayChoice()" aria-label="Close">&times;</button>
+                <h2 id="play-choice-title">Device is currently playing</h2>
+                <p class="play-choice-description">What would you like to do?</p>
+                <div class="play-choice-buttons">
+                    <button id="replace-queue-btn" class="btn btn-primary play-choice-btn">Replace Queue</button>
+                    <button id="play-next-btn" class="btn btn-secondary play-choice-btn">Play Next</button>
+                </div>
+                <button class="btn-link modal-cancel" onclick="dismissPlayChoice()">Cancel</button>
+            </div>
+        </div>
+
+        <!-- Playlist Restart Confirmation Modal -->
+        <div id="playlist-restart-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="playlist-restart-title">
+            <div class="modal-card">
+                <button class="modal-close" id="playlist-restart-cancel-x" aria-label="Close">&times;</button>
+                <h2 id="playlist-restart-title">Start a new playlist?</h2>
+                <p class="play-choice-description">You'll lose your current playlist progress.</p>
+                <div class="play-choice-buttons">
+                    <button id="playlist-restart-confirm" class="btn btn-primary play-choice-btn">Start Over</button>
+                    <button id="playlist-restart-cancel" class="btn btn-secondary play-choice-btn">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Recommend Restart Confirmation Modal -->
+        <div id="rec-restart-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="rec-restart-title">
+            <div class="modal-card">
+                <button class="modal-close" id="rec-restart-cancel-x" aria-label="Close">&times;</button>
+                <h2 id="rec-restart-title">Start a new recommendation?</h2>
+                <p class="play-choice-description">You'll lose your current recommendation.</p>
+                <div class="play-choice-buttons">
+                    <button id="rec-restart-confirm" class="btn btn-primary play-choice-btn">Start Over</button>
+                    <button id="rec-restart-cancel" class="btn btn-secondary play-choice-btn">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Play Now Success Modal -->
+        <div id="play-success-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="play-success-title">
+            <div class="modal-card modal-card--success">
+                <button class="modal-close" onclick="dismissPlaySuccess()" aria-label="Close">&times;</button>
+                <div class="success-hero">
+                    <div class="success-ring" aria-hidden="true">
+                        <svg class="success-ring-svg" viewBox="0 0 48 48" fill="none">
+                            <circle class="success-ring-bg" cx="24" cy="24" r="22" stroke-width="3"/>
+                            <circle class="success-ring-progress" cx="24" cy="24" r="22" stroke-width="3"/>
+                        </svg>
+                        <div class="success-ring-icon">&#9654;</div>
+                    </div>
+                    <h2 id="play-success-title">Now Playing</h2>
+                </div>
+                <div class="success-details">
+                    <p id="play-success-message" class="success-detail-line"></p>
+                </div>
+                <div class="success-actions">
+                    <button class="btn btn-ghost" onclick="dismissPlaySuccess()">Back to Tracks</button>
+                    <button id="play-success-new-btn" class="btn btn-primary">New Playlist</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Track Reason Bottom Sheet (Mobile) -->
+        <div id="bottom-sheet" class="bottom-sheet hidden" role="dialog" aria-modal="true" aria-labelledby="bottom-sheet-title">
+            <div class="bottom-sheet-backdrop"></div>
+            <div class="bottom-sheet-content">
+                <div class="bottom-sheet-handle" aria-hidden="true"></div>
+                <button class="modal-close bottom-sheet-close" onclick="closeBottomSheet()" aria-label="Close">&times;</button>
+                <h3 id="bottom-sheet-title" class="bottom-sheet-track-title"></h3>
+                <p class="bottom-sheet-track-artist"></p>
+                <p class="bottom-sheet-reason"></p>
+            </div>
+        </div>
+
         <!-- Error Toast -->
         <div id="error-toast" class="toast error hidden" role="alert" aria-live="assertive">
             <span id="error-message"></span>
@@ -376,11 +886,27 @@
             <button class="toast-close" onclick="hideSuccess()" aria-label="Dismiss message">&times;</button>
         </div>
 
+
         <!-- Footer -->
-        <footer class="app-footer">
-            <a href="https://github.com/ecwilsonaz/plexsage" target="_blank" rel="noopener" class="footer-brand">PlexSage</a>
-            <span class="footer-separator">·</span>
-            <span id="footer-model" class="footer-model">--</span>
+        <footer class="app-footer app-footer--loading">
+            <div class="footer-left">
+                <a href="https://github.com/ecwilsonaz/mediasage" target="_blank" rel="noopener" class="footer-brand">MediaSage <span id="footer-version"></span></a>
+                <span class="footer-separator">·</span>
+                <span id="footer-model" class="footer-model">--</span>
+            </div>
+            <button id="regenerate-btn" class="btn-link regenerate-link footer-results-only">
+                &#8635; Regenerate Playlist
+            </button>
+            <div class="footer-right">
+                <span id="footer-library-status" class="footer-library-status hidden">
+                    <span id="footer-track-count">--</span>
+                    <span id="footer-track-separator" class="footer-separator">·</span>
+                    <span id="footer-sync-time">--</span>
+                    <span class="footer-separator">·</span>
+                    <a href="#" id="footer-refresh-link" class="footer-refresh">Refresh</a>
+                </span>
+                <span class="cost-display footer-results-only" id="cost-display"></span>
+            </div>
         </footer>
     </div>
 

@@ -317,22 +317,35 @@ class TestLibrarySyncEndpoint:
 
         assert response.status_code == 503
 
-    def test_sync_returns_counts(self, client):
-        """POST /api/library/sync should report synced and total track counts."""
+    def test_sync_starts_background_sync(self, client):
+        """POST /api/library/sync kicks off a background sync and reports it."""
         mock_plex = MagicMock()
         mock_plex.is_connected.return_value = True
-        mock_plex.sync_track_db.return_value = 5
 
         with patch("backend.main.get_plex_client", return_value=mock_plex):
-            with patch("backend.main.get_track_db") as mock_db:
-                mock_db.return_value.get_track_count.return_value = 42
-                response = client.post("/api/library/sync?force=true")
+            with patch(
+                "backend.main.library_cache.get_sync_progress",
+                return_value={"is_syncing": False},
+            ):
+                with patch("backend.main.library_cache.sync_library"):
+                    response = client.post("/api/library/sync")
 
         assert response.status_code == 200
-        data = response.json()
-        assert data["synced"] == 5
-        assert data["total_tracks"] == 42
-        mock_plex.sync_track_db.assert_called_once_with(True)
+        assert response.json() == {"started": True, "blocking": False}
+
+    def test_sync_conflicts_when_already_running(self, client):
+        """POST /api/library/sync should 409 while a sync is already running."""
+        mock_plex = MagicMock()
+        mock_plex.is_connected.return_value = True
+
+        with patch("backend.main.get_plex_client", return_value=mock_plex):
+            with patch(
+                "backend.main.library_cache.get_sync_progress",
+                return_value={"is_syncing": True},
+            ):
+                response = client.post("/api/library/sync")
+
+        assert response.status_code == 409
 
 
 class TestFilterPreviewEndpoint:

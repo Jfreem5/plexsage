@@ -13,7 +13,7 @@ from backend.models import AppConfig, DefaultsConfig, LLMConfig, PlexConfig
 load_dotenv()
 
 # User config file path (for UI-saved settings)
-USER_CONFIG_PATH = Path("config.user.yaml")
+USER_CONFIG_PATH = Path("data/config.user.yaml")
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -85,17 +85,38 @@ def load_user_yaml_config() -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+class ConfigSaveError(Exception):
+    """Raised when configuration cannot be saved."""
+    pass
+
+
 def save_user_config(updates: dict[str, Any]) -> None:
     """Save user configuration to config.user.yaml.
 
     Only saves non-empty values. Preserves existing user config.
+
+    Raises:
+        ConfigSaveError: If file cannot be written (permissions, disk full, etc.)
     """
     existing = load_user_yaml_config()
     merged = deep_merge(existing, updates)
     cleaned = remove_empty_values(merged)
 
-    with open(USER_CONFIG_PATH, "w") as f:
-        yaml.dump(cleaned, f, default_flow_style=False)
+    try:
+        with open(USER_CONFIG_PATH, "w") as f:
+            yaml.dump(cleaned, f, default_flow_style=False)
+    except PermissionError:
+        raise ConfigSaveError(
+            f"Permission denied writing to {USER_CONFIG_PATH}. "
+            "Check that the data directory is writable. "
+            "For Docker, ensure the volume is mounted with correct permissions "
+            "(e.g., user directive or chown to UID 1000)."
+        )
+    except OSError as e:
+        raise ConfigSaveError(
+            f"Failed to save configuration to {USER_CONFIG_PATH}: {e}. "
+            "Check disk space and directory permissions."
+        )
 
 
 def get_env_or_yaml(
@@ -159,6 +180,8 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         api_key = openai_key
     elif provider == "gemini":
         api_key = gemini_key
+    elif provider == "custom":
+        api_key = os.environ.get("CUSTOM_LLM_API_KEY") or llm_yaml.get("api_key", "")
     else:
         api_key = llm_yaml.get("api_key", "")
 

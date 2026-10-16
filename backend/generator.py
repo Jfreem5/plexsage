@@ -4,28 +4,24 @@ import json
 import logging
 import math
 import time
-from collections.abc import Callable, Generator
-from dataclasses import dataclass
+from collections.abc import Generator
 from datetime import datetime
 
 from backend.llm_client import get_llm_client
-from backend.models import FilterSet, GenerateResponse, Track
-from backend.plex_client import PlexQueryError, get_plex_client, get_track_cache
+from backend.models import GenerateResponse, Track
+from backend.plex_client import PlexQueryError, get_plex_client
 from backend.prompt_classifier import (
     extract_decade_hints,
     extract_genre_hint_groups,
     extract_genre_hints,
     is_genre_keyword,
 )
-from backend.track_db import get_track_db
+from backend import library_cache
 
 logger = logging.getLogger(__name__)
 
-# Maximum number of tracks sent to the LLM after pre-ranking
+# Maximum number of candidate tracks ever sent to the LLM after pre-ranking.
 PRE_RANK_LIMIT = 500
-
-# Random sample size when a request has no filters (avoids loading the library)
-SAMPLE_SIZE = 2000
 
 
 # =============================================================================
@@ -136,7 +132,7 @@ def compute_track_budget(
 
 
 def _year_to_decade(year: int) -> str:
-    """Convert a year to its decade string (e.g., 1985 → "1980s")."""
+    """Convert a year to its decade string (e.g., 1985 -> "1980s")."""
     decade = (year // 10) * 10
     return f"{decade}s"
 
@@ -169,25 +165,26 @@ def _recency_score(last_played_ts: float | None, now: float, half_life_hours: fl
 def pre_rank_tracks(
     tracks: list[Track],
     prompt: str | None = None,
-    filters: FilterSet | None = None,
-    max_tracks: int = 500,
+    genres: list[str] | None = None,
+    decades: list[str] | None = None,
+    max_tracks: int = PRE_RANK_LIMIT,
 ) -> list[Track]:
     """Score and rank tracks using rule-based heuristics, returning the top N.
 
     Scoring components (total max = 100):
-        1. Genre match   (0-40)  — how well the track's genres match prompt hints
-        2. Decade match  (0-20)  — whether the track's year falls in hinted decades
-        3. User rating   (0-25)  — from the local SQLite track DB (0-10 scale)
-        4. Recency       (0-15)  — exponential decay on last_played (72h half-life)
+        1. Genre match   (0-40)  -- how well the track's genres match prompt hints
+        2. Decade match  (0-20)  -- whether the track's year falls in hinted decades
+        3. User rating   (0-25)  -- from the local library cache (0-10 scale)
+        4. Recency       (0-15)  -- exponential decay on last played (72h half-life)
 
     If no prompt hints are found, the function falls back to rating + recency
     only, so the LLM still gets a sensible ordering.
 
     Args:
-        tracks: Candidate tracks (already filtered by the Plex client).
+        tracks: Candidate tracks (already filtered by the Plex client/cache).
         prompt: The user's natural-language prompt (used for hint extraction).
-        filters: Optional FilterSet (genres/decades from the UI) — used as
-                 additional hard hints when the prompt is absent.
+        genres: Optional explicit genre filters -- additional hard hints.
+        decades: Optional explicit decade filters -- additional hard hints.
         max_tracks: Maximum number of tracks to return (0 = no limit).
 
     Returns:
@@ -205,17 +202,17 @@ def pre_rank_tracks(
     hinted_decades = extract_decade_hints(prompt_lower)
 
     # Merge in explicit filter genres/decades as additional hints
-    if filters:
-        for g in filters.genres:
-            hinted_genres.add(g.lower())
-        for d in filters.decades:
-            hinted_decades.add(d)
+    for g in genres or []:
+        hinted_genres.add(g.lower())
+    for d in decades or []:
+        hinted_decades.add(d)
 
-    # --- Fetch DB metadata in one batch ---
-    db = get_track_db()
+    # --- Fetch cache metadata in one batch ---
     metadata: dict[str, dict] = {}
-    if db:
-        metadata = db.get_metadata_batch([t.rating_key for t in tracks])
+    try:
+        metadata = library_cache.get_metadata_batch([t.rating_key for t in tracks])
+    except Exception:
+        logger.warning("Pre-rank metadata unavailable; ranking without ratings", exc_info=True)
 
     now = time.time()
     scored: list[tuple[float, Track]] = []
@@ -232,7 +229,7 @@ def pre_rank_tracks(
                 score += min(len(matched) / len(hinted_genres), 1.0) * 40
             else:
                 # Substring / partial match: does any track genre contain a hint
-                # or vice versa?  Gives a smaller bonus so near-misses still rank
+                # or vice versa? Gives a smaller bonus so near-misses still rank
                 # above completely unrelated tracks.
                 for tg in track_genres:
                     for hg in hinted_genres:
@@ -254,8 +251,7 @@ def pre_rank_tracks(
             rating = meta.get("user_rating", 0) or 0
             score += (rating / 10) * 25
 
-            last_played_raw = meta.get("last_played")
-            last_played_ts = _parse_timestamp(last_played_raw)
+            last_played_ts = _parse_timestamp(meta.get("last_viewed_at"))
             recency = _recency_score(last_played_ts, now)
             score += recency * 15
 
@@ -267,176 +263,136 @@ def pre_rank_tracks(
     return [t for _, t in scored[:max_tracks]]
 
 
-@dataclass
-class _PreparedGeneration:
-    """Candidates and prompt produced by the shared preparation stage."""
+def generate_narrative(
+    track_selections: list[dict],
+    llm_client,
+    user_request: str = "",
+) -> tuple[str, str]:
+    """Generate a creative title and narrative for the playlist.
 
-    candidates: list[Track]
-    prompt: str
+    Args:
+        track_selections: List of track dicts with artist, title, album, reason
+        llm_client: LLM client instance
+        user_request: Original user prompt/request for context
 
+    Returns:
+        Tuple of (playlist_title with date, narrative)
+        On failure, returns ("{Mon YYYY} Playlist", "")
+    """
+    # Build input for Query 2: track list with reasons
+    tracks_with_reasons = "\n".join(
+        f"- {sel.get('artist', 'Unknown')} - \"{sel.get('title', 'Unknown')}\": {sel.get('reason', 'Selected for this playlist')}"
+        for sel in track_selections[:15]  # Limit to first 15 for context efficiency
+    )
 
-def _noop_emit(event: str, data: dict) -> str:
-    """Progress sink for callers that don't stream (the non-SSE path)."""
-    return ""
+    # Include user request for context
+    if user_request:
+        narrative_prompt = f"User's request: {user_request}\n\nSelected tracks:\n{tracks_with_reasons}"
+    else:
+        narrative_prompt = f"Selected tracks:\n{tracks_with_reasons}"
 
+    # Get current month/year for title suffix
+    date_suffix = datetime.now().strftime("%b %Y")
+    fallback_title = f"{date_suffix} Playlist"
 
-def _collect_preparation(
-    preparation: Generator[str, None, _PreparedGeneration],
-) -> _PreparedGeneration:
-    """Drive a preparation generator to completion, discarding progress events."""
     try:
-        while True:
-            next(preparation)
-    except StopIteration as stop:
-        return stop.value
+        # Use analysis model for better creative writing quality
+        response = llm_client.analyze(narrative_prompt, NARRATIVE_SYSTEM)
+        result = llm_client.parse_json_response(response)
+
+        # Handle array-wrapped responses (some LLMs wrap in [])
+        if isinstance(result, list) and len(result) > 0:
+            result = result[0]
+
+        if not isinstance(result, dict):
+            logger.warning("Narrative response not a dict: %s", type(result).__name__)
+            return fallback_title, ""
+
+        raw_title = result.get("title", "").strip()
+
+        # Try common alternate keys for narrative
+        narrative = (
+            result.get("narrative")
+            or result.get("description")
+            or result.get("text")
+            or result.get("content")
+            or ""
+        ).strip()
+
+        # Log if we got title but no narrative (helps debug)
+        if raw_title and not narrative:
+            logger.warning("Narrative missing from response. Keys: %s", list(result.keys()))
+
+        # Append date to title
+        if raw_title:
+            playlist_title = f"{raw_title} - {date_suffix}"
+        else:
+            playlist_title = fallback_title
+
+        return playlist_title, narrative
+
+    except Exception as e:
+        logger.warning("Narrative generation failed: %s", e)
+        return fallback_title, ""
 
 
-def _prepare_generation(
-    emit: Callable[[str, dict], str],
+def _cached_track_to_model(cached: dict) -> Track:
+    """Convert a cached track dict to a Track model."""
+    return Track(
+        rating_key=cached["rating_key"],
+        title=cached["title"],
+        artist=cached["artist"],
+        album=cached["album"],
+        duration_ms=cached.get("duration_ms") or 0,
+        year=cached.get("year"),
+        genres=cached.get("genres") or [],
+        art_url=f"/api/art/{cached['rating_key']}",
+    )
+
+
+def _get_tracks_from_cache_or_plex(
     plex_client,
-    *,
-    prompt: str | None,
-    seed_track: Track | None,
-    selected_dimensions: list[str] | None,
-    additional_notes: str | None,
     genres: list[str] | None,
     decades: list[str] | None,
-    track_count: int,
     exclude_live: bool,
     min_rating: int,
     max_tracks_to_ai: int,
-) -> Generator[str, None, _PreparedGeneration]:
-    """Fetch candidates, mirror them locally, pre-rank, and build the LLM prompt.
+) -> list[Track]:
+    """Get tracks from cache if available, otherwise from Plex.
 
-    Shared by the streaming and non-streaming generation paths. Progress events
-    are formatted with *emit* and yielded; the pre-ranked candidates and the
-    finished prompt are returned when the generator completes.
-
-    Raises:
-        PlexQueryError: The Plex API could not serve the request.
-        ValueError: No track matched the selection.
+    Returns:
+        List of Track objects
     """
     has_filters = genres or decades or min_rating > 0
+    effective_limit = max_tracks_to_ai if max_tracks_to_ai > 0 else 2000
 
-    # Step 1: Fetch tracks. Unfiltered requests sample randomly (so repeat
-    # generations differ); filtered requests reuse the short-lived cache.
+    # Try cache first
+    if library_cache.has_cached_tracks():
+        logger.info("Using cached tracks for generation")
+        cached_tracks = library_cache.get_tracks_by_filters(
+            genres=genres,
+            decades=decades,
+            min_rating=min_rating,
+            exclude_live=exclude_live,
+            limit=effective_limit,
+        )
+        return [_cached_track_to_model(t) for t in cached_tracks]
+
+    # Fall back to Plex
+    logger.info("Cache empty, fetching from Plex")
     if not has_filters:
-        yield emit("progress", {"step": "fetching", "message": "Sampling random tracks from library..."})
-        logger.info("No filters applied, fetching %d random tracks", SAMPLE_SIZE)
-        filtered_tracks = plex_client.get_random_tracks(
-            count=SAMPLE_SIZE,
+        return plex_client.get_random_tracks(
+            count=effective_limit,
             exclude_live=exclude_live,
         )
-        logger.info("Got %d random tracks", len(filtered_tracks))
     else:
-        track_cache = get_track_cache()
-        cached_tracks = track_cache.get(genres, decades, exclude_live, min_rating)
-
-        if cached_tracks is not None:
-            yield emit("progress", {"step": "cache_hit", "message": "Using cached library results..."})
-            filtered_tracks = cached_tracks
-            logger.info("Using %d cached tracks", len(filtered_tracks))
-        else:
-            yield emit("progress", {"step": "fetching", "message": "Fetching tracks from library..."})
-            logger.info("Fetching tracks with filters: genres=%s, decades=%s, min_rating=%s", genres, decades, min_rating)
-            filtered_tracks = plex_client.get_tracks_by_filters(
-                genres=genres,
-                decades=decades,
-                exclude_live=exclude_live,
-                min_rating=min_rating,
-            )
-            # Cache for potential future use
-            track_cache.set(genres, decades, exclude_live, min_rating, filtered_tracks)
-            logger.info("Found %d tracks matching filters", len(filtered_tracks))
-
-    if not filtered_tracks:
-        raise ValueError("No tracks match the selected filters. Try broadening your selection.")
-
-    # Step 2: Mirror a Plex-served batch locally, then pre-rank. A read served
-    # by the local DB is already mirrored, so only re-sync on a Plex fallback.
-    if not plex_client.db_available():
-        db = get_track_db()
-        if db:
-            db.sync_from_plex(filtered_tracks)
-
-    llm_limit = compute_track_budget(
-        prompt=prompt,
-        requested_max=max_tracks_to_ai,
-        track_count=track_count,
-        pool_size=len(filtered_tracks),
-        genres=genres,
-        decades=decades,
-    )
-    logger.info("Pre-ranking %d candidates, retaining %d", len(filtered_tracks), llm_limit)
-    yield emit("progress", {"step": "pre_ranking", "message": f"Ranking {len(filtered_tracks)} candidates…", "candidates": len(filtered_tracks), "retained": llm_limit})
-    pre_rank_filters = FilterSet(genres=genres or [], decades=decades or []) if has_filters else None
-    candidates = pre_rank_tracks(filtered_tracks, prompt, filters=pre_rank_filters, max_tracks=llm_limit)
-
-    # Step 3: Build the prompt from the pre-ranked candidates.
-    yield emit("progress", {"step": "preparing", "message": f"Preparing {len(candidates)} tracks for AI..."})
-
-    track_list = "\n".join(
-        f"{i+1}. {t.artist} - {t.title} ({t.album}, {t.year or 'Unknown year'})"
-        for i, t in enumerate(candidates)
-    )
-
-    generation_parts = []
-
-    if prompt:
-        generation_parts.append(f"User's request: {prompt}")
-
-    if seed_track:
-        generation_parts.append(
-            f"Seed track: {seed_track.title} by {seed_track.artist} "
-            f"(from {seed_track.album}, {seed_track.year or 'Unknown year'})"
+        return plex_client.get_tracks_by_filters(
+            genres=genres,
+            decades=decades,
+            exclude_live=exclude_live,
+            min_rating=min_rating,
+            limit=effective_limit,
         )
-        if selected_dimensions:
-            generation_parts.append(f"Explore these dimensions: {', '.join(selected_dimensions)}")
-
-    if additional_notes:
-        generation_parts.append(f"Additional notes: {additional_notes}")
-
-    generation_parts.append(f"\nSelect {track_count} tracks from this library:\n{track_list}")
-
-    return _PreparedGeneration(
-        candidates=candidates,
-        prompt="\n\n".join(generation_parts),
-    )
-
-
-def _match_selections(
-    candidates: list[Track],
-    selections: list[dict],
-    track_count: int,
-    seed_track: Track | None,
-) -> list[Track]:
-    """Resolve the LLM's ``{artist, title}`` picks against the candidates.
-
-    Indexes the candidates once (exact match first, then trigram-pruned fuzzy)
-    and returns the matching tracks in selection order, excluding the seed.
-    """
-    matched_tracks: list[Track] = []
-    used_keys: set[str] = set()
-
-    if seed_track:
-        used_keys.add(seed_track.rating_key)
-
-    matcher = TrackMatcher(candidates)
-
-    for selection in selections:
-        if len(matched_tracks) >= track_count:
-            break
-
-        track = matcher.match(
-            selection.get("artist", ""),
-            selection.get("title", ""),
-            used_keys,
-        )
-        if track is not None:
-            matched_tracks.append(track)
-            used_keys.add(track.rating_key)
-
-    return matched_tracks
 
 
 def generate_playlist_stream(
@@ -444,6 +400,7 @@ def generate_playlist_stream(
     seed_track: Track | None = None,
     selected_dimensions: list[str] | None = None,
     additional_notes: str | None = None,
+    refinement_answers: list[str | None] | None = None,
     genres: list[str] | None = None,
     decades: list[str] | None = None,
     track_count: int = 25,
@@ -470,17 +427,24 @@ def generate_playlist_stream(
             yield emit("error", {"message": "Plex client not initialized"})
             return
 
+        has_filters = genres or decades or min_rating > 0
+
+        # Step 1: Fetch tracks from cache or Plex
+        using_cache = library_cache.has_cached_tracks()
+        if using_cache:
+            yield emit("progress", {"step": "fetching", "message": "Loading tracks from cache..."})
+        elif not has_filters:
+            yield emit("progress", {"step": "fetching", "message": "Sampling random tracks from library..."})
+        else:
+            yield emit("progress", {"step": "fetching", "message": "Fetching tracks from library..."})
+
+        logger.info("Fetching tracks: genres=%s, decades=%s, min_rating=%s, using_cache=%s",
+                    genres, decades, min_rating, using_cache)
         try:
-            prepared = yield from _prepare_generation(
-                emit,
-                plex_client,
-                prompt=prompt,
-                seed_track=seed_track,
-                selected_dimensions=selected_dimensions,
-                additional_notes=additional_notes,
+            filtered_tracks = _get_tracks_from_cache_or_plex(
+                plex_client=plex_client,
                 genres=genres,
                 decades=decades,
-                track_count=track_count,
                 exclude_live=exclude_live,
                 min_rating=min_rating,
                 max_tracks_to_ai=max_tracks_to_ai,
@@ -489,11 +453,88 @@ def generate_playlist_stream(
             yield emit("error", {"message": f"Plex server error: {e}"})
             return
 
+        logger.info("Got %d tracks", len(filtered_tracks))
+
+        if not filtered_tracks:
+            yield emit("error", {"message": "No tracks match the selected filters. Try broadening your selection."})
+            return
+
+        # Step 1b: Size the candidate set and pre-rank locally.
+        # A specific genre/decade request can pick from a smaller pool, while a
+        # vague mood prompt keeps a wider one. This trimming costs no tokens.
+        budget = compute_track_budget(
+            prompt=prompt,
+            requested_max=max_tracks_to_ai,
+            track_count=track_count,
+            pool_size=len(filtered_tracks),
+            genres=genres,
+            decades=decades,
+        )
+        if budget > 0 and len(filtered_tracks) > budget:
+            pool_size = len(filtered_tracks)
+            yield emit(
+                "progress",
+                {"step": "pre_ranking", "message": f"Pre-ranking {pool_size} tracks locally..."},
+            )
+            filtered_tracks = pre_rank_tracks(
+                filtered_tracks,
+                prompt=prompt,
+                genres=genres,
+                decades=decades,
+                max_tracks=budget,
+            )
+            logger.info(
+                "Pre-ranked candidates from %d to %d (budget=%d)",
+                pool_size,
+                len(filtered_tracks),
+                budget,
+            )
+
+        # Step 2: Report track count (sampling already done server-side)
+        if has_filters:
+            yield emit("progress", {"step": "filtering", "message": f"Using {len(filtered_tracks)} tracks..."})
+        else:
+            yield emit("progress", {"step": "filtering", "message": f"Using {len(filtered_tracks)} random tracks..."})
+
+        # Step 3: Build track list
+        yield emit("progress", {"step": "preparing", "message": f"Preparing {len(filtered_tracks)} tracks for AI..."})
+
+        track_list = "\n".join(
+            f"{i+1}. {t.artist} - {t.title} ({t.album}, {t.year or 'Unknown year'})"
+            for i, t in enumerate(filtered_tracks)
+        )
+
+        # Build the generation prompt
+        generation_parts = []
+
+        if prompt:
+            generation_parts.append(f"User's request: {prompt}")
+
+        if seed_track:
+            generation_parts.append(
+                f"Seed track: {seed_track.title} by {seed_track.artist} "
+                f"(from {seed_track.album}, {seed_track.year or 'Unknown year'})"
+            )
+            if selected_dimensions:
+                generation_parts.append(f"Explore these dimensions: {', '.join(selected_dimensions)}")
+
+        if additional_notes:
+            generation_parts.append(f"Additional notes: {additional_notes}")
+
+        if refinement_answers:
+            answered = [a for a in refinement_answers if a]
+            if answered:
+                generation_parts.append(f"User preferences: {', '.join(answered)}")
+
+        generation_parts.append(f"\nSelect {track_count} tracks from this library:\n{track_list}")
+
+        generation_prompt = "\n\n".join(generation_parts)
+
         # Step 4: Call LLM
         yield emit("progress", {"step": "ai_working", "message": "AI is curating your playlist..."})
 
-        logger.info("Calling LLM with prompt length: %d chars", len(prepared.prompt))
-        response = llm_client.generate(prepared.prompt, GENERATION_SYSTEM)
+        logger.info("Calling LLM with prompt length: %d chars", len(generation_prompt))
+        response = llm_client.generate(generation_prompt, GENERATION_SYSTEM)
         logger.info("LLM response received: %d input, %d output tokens", response.input_tokens, response.output_tokens)
 
         # Step 5: Parse response
@@ -508,20 +549,125 @@ def generate_playlist_stream(
         # Step 6: Match tracks
         yield emit("progress", {"step": "matching", "message": f"Matching {len(track_selections)} selections to library..."})
 
-        matched_tracks = _match_selections(
-            prepared.candidates, track_selections, track_count, seed_track
-        )
+        matched_tracks: list[Track] = []
+        used_keys: set[str] = set()
+        track_reasons: dict[str, str] = {}
 
-        # Step 7: Complete
+        if seed_track:
+            used_keys.add(seed_track.rating_key)
+
+        for selection in track_selections:
+            if len(matched_tracks) >= track_count:
+                break
+
+            artist = selection.get("artist", "")
+            title = selection.get("title", "")
+            reason = selection.get("reason", "")
+
+            for track in filtered_tracks:
+                if track.rating_key in used_keys:
+                    continue
+
+                if _tracks_match(artist, title, track):
+                    matched_tracks.append(track)
+                    used_keys.add(track.rating_key)
+                    if reason:
+                        track_reasons[track.rating_key] = reason
+                    break
+
+        # Step 7: Generate narrative
+        yield emit("progress", {"step": "narrative", "message": "Writing playlist narrative..."})
+
+        playlist_title, narrative = generate_narrative(track_selections, llm_client, prompt or "")
+        logger.info("Generated narrative: title='%s', narrative_len=%d", playlist_title, len(narrative))
+
+        # Emit narrative event for frontend
+        yield emit("narrative", {
+            "playlist_title": playlist_title,
+            "narrative": narrative,
+            "track_reasons": track_reasons,
+            "user_request": prompt or "",
+        })
+
+        # Step 8: Complete
+        logger.info("Track matching complete. Matched %d tracks", len(matched_tracks))
+        logger.info("Emitting 'Playlist ready!' progress event")
         yield emit("progress", {"step": "complete", "message": "Playlist ready!"})
 
-        result = GenerateResponse(
-            tracks=matched_tracks,
-            token_count=response.total_tokens,
-            estimated_cost=response.estimated_cost(),
-        )
+        logger.info("Building GenerateResponse: tokens=%s, cost=%s",
+                    getattr(response, 'total_tokens', 'N/A'),
+                    response.estimated_cost() if response else 'N/A')
 
-        yield emit("complete", result.model_dump(mode="json"))
+        try:
+            result = GenerateResponse(
+                tracks=matched_tracks,
+                token_count=response.total_tokens,
+                estimated_cost=response.estimated_cost(),
+                playlist_title=playlist_title,
+                narrative=narrative,
+                track_reasons=track_reasons,
+            )
+            logger.info("GenerateResponse built successfully with %d tracks", len(result.tracks))
+        except Exception as e:
+            logger.exception("Failed to build GenerateResponse: %s", e)
+            yield emit("error", {"message": f"Failed to build response: {e}"})
+            return
+
+        # Send tracks in batches to work around iOS Safari dropping large SSE events.
+        # Safari Mobile has undocumented buffering limits that can cause large events
+        # to be silently dropped. Batching keeps each event small (~2KB).
+        tracks_data = [t.model_dump(mode="json") for t in result.tracks]
+        batch_size = 5
+        for i in range(0, len(tracks_data), batch_size):
+            batch = tracks_data[i:i + batch_size]
+            logger.info("Emitting track batch %d-%d", i, i + len(batch))
+            yield emit("tracks", {"batch": batch, "index": i})
+
+        # Save result to history before emitting the final event
+        result_id = None
+        try:
+            result_type = "seed_playlist" if seed_track else "prompt_playlist"
+            # Title: always use the LLM-generated playlist title
+            result_title = playlist_title
+            # Use first track's rating key for card thumbnail
+            first_art_key = matched_tracks[0].rating_key if matched_tracks else None
+            # Subtitle: seed playlists show origin track, prompt playlists show prompt + count
+            if seed_track:
+                result_subtitle = f"From: {seed_track.title} by {seed_track.artist} \u00b7 {len(matched_tracks)} tracks"
+            elif prompt:
+                result_subtitle = f"{prompt} \u00b7 {len(matched_tracks)} tracks"
+            else:
+                result_subtitle = f"{len(matched_tracks)} tracks"
+            result_id = library_cache.save_result(
+                result_type=result_type,
+                title=result_title,
+                prompt=prompt or "",
+                snapshot=result.model_dump(mode="json"),
+                track_count=len(matched_tracks),
+                art_rating_key=first_art_key,
+                subtitle=result_subtitle,
+            )
+        except Exception as e:
+            logger.warning("Failed to save result: %s", e)
+
+        # Emit small complete event with just metadata
+        logger.info("Emitting complete event")
+        complete_data = {
+            "track_count": len(result.tracks),
+            "token_count": result.token_count,
+            "estimated_cost": result.estimated_cost,
+            "playlist_title": result.playlist_title,
+            "narrative": result.narrative,
+            "track_reasons": result.track_reasons,
+        }
+        if result_id:
+            complete_data["result_id"] = result_id
+        yield emit("complete", complete_data)
+        logger.info("Complete event emitted successfully")
+
+        # Trailing padding to push complete event through network buffers (iOS Safari fix)
+        # SSE comments (lines starting with ':') are ignored by the parser but help flush buffers
+        yield ": heartbeat\n\n"
 
     except Exception as e:
         logger.exception("Error during playlist generation")
@@ -534,7 +680,7 @@ You will be given:
 1. A description of what the user wants (prompt, seed track dimensions, or both)
 2. A numbered list of tracks that are available in their library
 
-Your task is to select tracks that best match the user's request. Return your selections as a JSON array of objects with artist, album, and title.
+Your task is to select tracks that best match the user's request. For each track, include a brief reason (1 sentence) explaining why it fits.
 
 Guidelines:
 - Select tracks that fit the mood, era, style, and other aspects of the request
@@ -544,267 +690,49 @@ Guidelines:
 
 Return ONLY a JSON array like:
 [
-  {"artist": "Artist Name", "album": "Album Name", "title": "Track Title"},
+  {"artist": "Artist Name", "album": "Album Name", "title": "Track Title", "reason": "Brief explanation of why this track fits."},
   ...
 ]
 
 No markdown formatting, no explanations - just the JSON array."""
 
 
-def generate_playlist(
-    prompt: str | None = None,
-    seed_track: Track | None = None,
-    selected_dimensions: list[str] | None = None,
-    additional_notes: str | None = None,
-    genres: list[str] | None = None,
-    decades: list[str] | None = None,
-    track_count: int = 25,
-    exclude_live: bool = True,
-    min_rating: int = 0,
-    max_tracks_to_ai: int = 500,
-) -> GenerateResponse:
-    """Generate a playlist using the filter-first approach.
+NARRATIVE_SYSTEM = """You are a music connoisseur writing a brief liner note for a playlist.
 
-    Args:
-        prompt: Natural language description (prompt-first flow)
-        seed_track: Seed track for finding similar music (seed flow)
-        selected_dimensions: Dimension IDs selected by user (seed flow)
-        additional_notes: Extra user preferences
-        genres: Genre filters to apply
-        decades: Decade filters to apply
-        track_count: Number of tracks to generate
-        exclude_live: Whether to exclude live recordings
-        min_rating: Minimum track rating (0-10, 0 = no filter)
-        max_tracks_to_ai: Max tracks to send to AI (0 = no limit)
+Given the user's original request and the track selections (with reasons), create:
+1. A creative playlist title (2-5 words, evocative, do NOT include any date)
+2. A brief narrative (3 sentences, under 400 characters) that:
+   - Reflects the mood or theme the user asked for
+   - Mentions 3-4 specific songs by name (use single quotes around song names, e.g. 'Skinny Love')
 
-    Returns:
-        GenerateResponse with tracks, token count, and estimated cost
+Sound like a passionate music lover. Be concise.
 
-    Raises:
-        ValueError: If no tracks match filters or LLM response invalid
-        RuntimeError: If clients not initialized
-    """
-    logger.info("Starting playlist generation")
-    llm_client = get_llm_client()
-    plex_client = get_plex_client()
+Return ONLY valid JSON:
+{"title": "Creative Title Here", "narrative": "Your brief narrative with 'song names' in single quotes..."}
 
-    if not llm_client:
-        raise RuntimeError("LLM client not initialized")
-    if not plex_client:
-        raise RuntimeError("Plex client not initialized")
-
-    # Fetch → mirror → pre-rank → prompt is shared with the streaming path.
-    preparation = _prepare_generation(
-        _noop_emit,
-        plex_client,
-        prompt=prompt,
-        seed_track=seed_track,
-        selected_dimensions=selected_dimensions,
-        additional_notes=additional_notes,
-        genres=genres,
-        decades=decades,
-        track_count=track_count,
-        exclude_live=exclude_live,
-        min_rating=min_rating,
-        max_tracks_to_ai=max_tracks_to_ai,
-    )
-    try:
-        prepared = _collect_preparation(preparation)
-    except PlexQueryError as e:
-        raise RuntimeError(f"Plex server error while fetching tracks: {e}") from e
-
-    # Call LLM
-    logger.info("Calling LLM with prompt length: %d chars", len(prepared.prompt))
-    response = llm_client.generate(prepared.prompt, GENERATION_SYSTEM)
-    logger.info("LLM response received: %d input, %d output tokens", response.input_tokens, response.output_tokens)
-
-    # Parse response
-    logger.debug("Parsing JSON response")
-    track_selections = llm_client.parse_json_response(response)
-
-    if not isinstance(track_selections, list):
-        raise ValueError("LLM returned invalid track selection format")
-
-    matched_tracks = _match_selections(
-        prepared.candidates, track_selections, track_count, seed_track
-    )
-
-    return GenerateResponse(
-        tracks=matched_tracks,
-        token_count=response.total_tokens,
-        estimated_cost=response.estimated_cost(),
-    )
-
-
-def _trigrams(s: str) -> frozenset[str]:
-    """Return the set of character trigrams in *s*.
-
-    Strings shorter than three characters collapse to a single gram (the
-    string itself) so they still participate in the index.
-    """
-    if not s:
-        return frozenset()
-    if len(s) < 3:
-        return frozenset({s})
-    return frozenset(s[i : i + 3] for i in range(len(s) - 2))
-
-
-def _simplified_artist_variants(artist: str) -> list[str]:
-    """Normalized artist variants, simplified for fuzzy comparison."""
-    from backend.plex_client import normalize_artist, simplify_string
-
-    return [simplify_string(v) for v in normalize_artist(artist)]
-
-
-def _fuzzy_track_match(
-    llm_title_simple: str,
-    llm_artist_variants: list[str],
-    lib_title_simple: str,
-    lib_artist_simple: str,
-) -> bool:
-    """Fuzzy-compare pre-simplified title/artist strings."""
-    from rapidfuzz import fuzz
-    from backend.plex_client import FUZZ_THRESHOLD
-
-    if fuzz.ratio(llm_title_simple, lib_title_simple) < FUZZ_THRESHOLD:
-        return False
-
-    return any(
-        fuzz.ratio(variant, lib_artist_simple) >= FUZZ_THRESHOLD
-        for variant in llm_artist_variants
-    )
+No markdown formatting, no explanations - just the JSON object."""
 
 
 def _tracks_match(llm_artist: str, llm_title: str, library_track: Track) -> bool:
-    """Check whether a single LLM selection matches a library track.
+    """Check if LLM selection matches a library track.
 
-    Convenience wrapper that simplifies the inputs on the fly. Batch matching
-    should use :class:`TrackMatcher`, which precomputes these values once.
+    Uses fuzzy matching to handle slight variations in naming.
     """
-    from backend.plex_client import simplify_string
+    from rapidfuzz import fuzz
+    from backend.plex_client import simplify_string, normalize_artist, FUZZ_THRESHOLD
 
-    return _fuzzy_track_match(
-        simplify_string(llm_title),
-        _simplified_artist_variants(llm_artist),
-        simplify_string(library_track.title),
-        simplify_string(library_track.artist),
-    )
+    # Compare titles
+    simplified_llm_title = simplify_string(llm_title)
+    simplified_lib_title = simplify_string(library_track.title)
 
+    if fuzz.ratio(simplified_llm_title, simplified_lib_title) < FUZZ_THRESHOLD:
+        return False
 
-# Above this fraction of the candidate list, unioning trigram posting lists
-# costs more than it saves, so the matcher falls back to a linear scan (which
-# still benefits from precomputed simplified keys).
-_CANDIDATE_FRACTION = 0.25
-_MIN_CANDIDATE_CAP = 50
-_EMPTY: frozenset[int] = frozenset()
+    # Compare artists (with variations)
+    for artist_variant in normalize_artist(llm_artist):
+        simplified_artist = simplify_string(artist_variant)
+        simplified_lib_artist = simplify_string(library_track.artist)
+        if fuzz.ratio(simplified_artist, simplified_lib_artist) >= FUZZ_THRESHOLD:
+            return True
 
-
-class TrackMatcher:
-    """Resolve LLM track selections against a fixed candidate list.
-
-    Precomputes simplified title/artist strings, an exact-match dictionary, and
-    a trigram inverted index once per generation. Each selection is then
-    resolved with roughly ``O(k)`` fuzzy comparisons (``k`` = tracks sharing a
-    trigram with the selection) instead of scanning every candidate.
-
-    Resolution order:
-      1. Normalized exact match (``(artist, title)``), including ``&``/``and``
-         artist variants.
-      2. Fuzzy match over trigram candidates.
-      3. Full-scan fallback, so a genuine match is never dropped when trigrams
-         don't overlap (e.g. very short titles).
-
-    The candidate list is already a small, pre-ranked in-memory set, so an
-    in-memory index is preferred over a SQLite FTS round-trip: it avoids I/O and
-    preserves the pre-rank ordering used for deterministic tie-breaking.
-    """
-
-    def __init__(self, tracks: list[Track]) -> None:
-        from backend.plex_client import normalize_artist, simplify_string
-
-        self._tracks = tracks
-        self._simple_titles: list[str] = []
-        self._simple_artists: list[str] = []
-        self._exact: dict[tuple[str, str], list[int]] = {}
-        self._index: dict[str, set[int]] = {}
-        self._candidate_cap = max(
-            _MIN_CANDIDATE_CAP, int(len(tracks) * _CANDIDATE_FRACTION)
-        )
-
-        for i, track in enumerate(tracks):
-            simple_title = simplify_string(track.title)
-            simple_artist = simplify_string(track.artist)
-            self._simple_titles.append(simple_title)
-            self._simple_artists.append(simple_artist)
-
-            for variant in normalize_artist(track.artist):
-                # The original variant simplifies to simple_artist already.
-                simple_variant = (
-                    simple_artist if variant == track.artist else simplify_string(variant)
-                )
-                key = (simple_variant, simple_title)
-                self._exact.setdefault(key, []).append(i)
-
-            # Index titles only: _fuzzy_track_match requires a title match
-            # first, so title trigrams are the precise blocking key.
-            for gram in _trigrams(simple_title):
-                self._index.setdefault(gram, set()).add(i)
-
-    def _fuzzy(self, index: int, simple_title: str, variants: list[str]) -> bool:
-        """Fuzzy-compare a selection against a precomputed candidate."""
-        return _fuzzy_track_match(
-            simple_title,
-            variants,
-            self._simple_titles[index],
-            self._simple_artists[index],
-        )
-
-    def _candidates(self, simple_title: str) -> set[int] | None:
-        """Return title-trigram candidates, or None if the overlap is too broad."""
-        found: set[int] = set()
-        for gram in _trigrams(simple_title):
-            found |= self._index.get(gram, _EMPTY)
-            if len(found) > self._candidate_cap:
-                return None
-        return found
-
-    def match(self, artist: str, title: str, used: set[str]) -> Track | None:
-        """Return the best unused library track for an LLM selection, or None."""
-        from backend.plex_client import simplify_string
-
-        simple_title = simplify_string(title)
-        variants = _simplified_artist_variants(artist)
-
-        # 1) Normalized exact match.
-        for variant in variants:
-            for index in self._exact.get((variant, simple_title), ()):
-                track = self._tracks[index]
-                if track.rating_key not in used:
-                    return track
-
-        # 2) Fuzzy match over trigram candidates.
-        candidates = self._candidates(simple_title)
-        if candidates is None:
-            # Overlap too broad to prune: scan every track in library order.
-            for index, track in enumerate(self._tracks):
-                if track.rating_key in used:
-                    continue
-                if self._fuzzy(index, simple_title, variants):
-                    return track
-            return None
-
-        for index in sorted(candidates):
-            track = self._tracks[index]
-            if track.rating_key in used:
-                continue
-            if self._fuzzy(index, simple_title, variants):
-                return track
-
-        # 3) Fallback: scan tracks trigrams didn't surface so no match is lost.
-        for index, track in enumerate(self._tracks):
-            if index in candidates or track.rating_key in used:
-                continue
-            if self._fuzzy(index, simple_title, variants):
-                return track
-
-        return None
+    return False

@@ -3,10 +3,10 @@
 import time
 from unittest.mock import MagicMock, patch
 
-import pytest
+from requests.exceptions import ConnectionError as RequestsConnectionError
 
-from backend.models import Track
-from backend.plex_client import TrackCache, is_live_version
+from backend.models import PlexPlaylistInfo, Track
+from backend.plex_client import TrackCache
 
 
 class TestPlexClientConnection:
@@ -55,6 +55,74 @@ class TestPlexClientConnection:
             client = PlexClient("http://localhost:32400", "token", "NonexistentLibrary")
             assert client.is_connected() is False
             assert "library" in client.get_error().lower() or "not found" in client.get_error().lower()
+
+
+class TestPlexClientReconnect:
+    """Tests for lazy reconnection with cooldown."""
+
+    def test_reconnect_attempted_when_disconnected(self, mocker):
+        """Should attempt reconnection when disconnected and cooldown passed."""
+        from backend.plex_client import PlexClient
+        from requests.exceptions import ConnectionError
+
+        # First connection fails
+        with patch("backend.plex_client.PlexServer", side_effect=ConnectionError("Connection refused")):
+            client = PlexClient("http://localhost:32400", "token", "Music")
+            assert client.is_connected() is False
+
+        # Now server is available - mock successful connection
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            # Force cooldown to be passed
+            client._last_reconnect_attempt = 0
+            assert client.is_connected() is True
+
+    def test_reconnect_respects_cooldown(self, mocker):
+        """Should not attempt reconnection if cooldown hasn't passed."""
+        from backend.plex_client import PlexClient
+        from requests.exceptions import ConnectionError
+
+        connect_count = 0
+        def mock_connect(*args, **kwargs):
+            nonlocal connect_count
+            connect_count += 1
+            raise ConnectionError("Connection refused")
+
+        with patch("backend.plex_client.PlexServer", side_effect=mock_connect):
+            client = PlexClient("http://localhost:32400", "token", "Music")
+            initial_count = connect_count
+
+            # Multiple is_connected() calls within cooldown should not retry
+            client.is_connected()
+            client.is_connected()
+            client.is_connected()
+
+            # Should only have the initial connection attempt
+            assert connect_count == initial_count
+
+    def test_reconnect_after_cooldown(self, mocker):
+        """Should retry connection after cooldown period."""
+        from backend.plex_client import PlexClient
+        from requests.exceptions import ConnectionError
+
+        connect_count = 0
+        def mock_connect(*args, **kwargs):
+            nonlocal connect_count
+            connect_count += 1
+            raise ConnectionError("Connection refused")
+
+        with patch("backend.plex_client.PlexServer", side_effect=mock_connect):
+            client = PlexClient("http://localhost:32400", "token", "Music")
+            initial_count = connect_count
+
+            # Simulate cooldown passed
+            client._last_reconnect_attempt = time.time() - client.RECONNECT_COOLDOWN - 1
+            client.is_connected()
+
+            # Should have attempted another connection
+            assert connect_count == initial_count + 1
 
 
 class TestPlexClientLibraryStats:
@@ -383,377 +451,694 @@ class TestTrackCache:
         assert cache.get(["Jazz"], [], True, 0) is not None
 
 
-def _make_plex_track(
-    rating_key="123",
-    title="Fake Plastic Trees",
-    artist="Radiohead",
-    album="The Bends",
-    year=1995,
-    duration=290000,
-    genres=("Alternative", "Rock"),
-    user_rating=9,
-    view_count=5,
-    last_viewed_at=1700000000,
-):
-    """Build a MagicMock that quacks like a Plex track object."""
-    track = MagicMock()
-    track.ratingKey = rating_key
-    track.title = title
-    track.grandparentTitle = artist
-    track.parentTitle = album
-    track.parentYear = year
-    track.duration = duration
-    track.genres = [MagicMock(tag=g) for g in genres]
-    track.userRating = user_rating
-    track.viewCount = view_count
-    track.lastViewedAt = last_viewed_at
-    return track
+class TestPlexClientGetClients:
+    """Tests for get_clients() method that discovers online Plex clients."""
 
+    def _make_mock_client(
+        self,
+        machine_id: str = "abc123",
+        title: str = "Living Room TV",
+        product: str = "Plex for LG",
+        platform: str = "webOS",
+        protocol_capabilities: str = "timeline,playback,navigation",
+        is_playing: bool = False,
+    ) -> MagicMock:
+        """Helper to create a mock Plex client resource."""
+        client = MagicMock()
+        client.machineIdentifier = machine_id
+        client.title = title
+        client.product = product
+        client.platform = platform
+        client.protocolCapabilities = protocol_capabilities
+        client.isPlayingMedia.return_value = is_playing
+        return client
 
-class TestPlexClientTrackDB:
-    """Reads should be served from the local TrackDB when it is populated."""
-
-    def _client(self):
+    def test_get_clients_returns_playback_capable_clients(self):
+        """Should only return clients that have 'playback' in protocolCapabilities."""
         from backend.plex_client import PlexClient
 
-        mock_library = MagicMock()
-        mock_server = MagicMock()
-        mock_server.library.section.return_value = mock_library
-        with patch("backend.plex_client.PlexServer", return_value=mock_server):
-            client = PlexClient("http://localhost:32400", "token", "Music")
-        return client, mock_library
-
-    def _make_db(self, tmp_path, populate=True):
-        from backend.track_db import TrackDB
-
-        db = TrackDB(tmp_path / "plex.db")
-        if populate:
-            db.upsert_tracks(
-                [
-                    Track(
-                        rating_key="1",
-                        title="Fake Plastic Trees",
-                        artist="Radiohead",
-                        album="The Bends",
-                        duration_ms=290000,
-                        year=1995,
-                        genres=["Alternative", "Rock"],
-                    ),
-                    Track(
-                        rating_key="2",
-                        title="Black",
-                        artist="Pearl Jam",
-                        album="Ten",
-                        duration_ms=340000,
-                        year=1991,
-                        genres=["Grunge", "Rock"],
-                    ),
-                ],
-                is_live_flags=[False, False],
-                user_ratings=[9, 8],
-            )
-            db.set_last_sync()
-        return db
-
-    def test_filters_use_track_db(self, tmp_path):
-        """get_tracks_by_filters should not touch Plex when the DB has data."""
-        client, mock_library = self._client()
-        db = self._make_db(tmp_path)
-
-        with patch("backend.plex_client.get_track_db", return_value=db):
-            results = client.get_tracks_by_filters(genres=["Rock"])
-
-        assert {t.title for t in results} == {"Fake Plastic Trees", "Black"}
-        mock_library.search.assert_not_called()
-
-    def test_count_uses_track_db(self, tmp_path):
-        client, mock_library = self._client()
-        db = self._make_db(tmp_path)
-
-        with patch("backend.plex_client.get_track_db", return_value=db):
-            count = client.count_tracks_by_filters(genres=["Rock"])
-
-        assert count == 2
-        mock_library.search.assert_not_called()
-
-    def test_search_uses_track_db(self, tmp_path):
-        client, mock_library = self._client()
-        db = self._make_db(tmp_path)
-
-        with patch("backend.plex_client.get_track_db", return_value=db):
-            results = client.search_tracks("radio")
-
-        assert [t.title for t in results] == ["Fake Plastic Trees"]
-        mock_library.searchTracks.assert_not_called()
-
-    def test_library_stats_use_track_db(self, tmp_path):
-        client, mock_library = self._client()
-        db = self._make_db(tmp_path)
-
-        with patch("backend.plex_client.get_track_db", return_value=db):
-            stats = client.get_library_stats()
-
-        assert stats["total_tracks"] == 2
-        # Genre counts come from the DB, which Plex's filter-choices API lacks.
-        assert {g["name"]: g["count"] for g in stats["genres"]}["Rock"] == 2
-        mock_library.listFilterChoices.assert_not_called()
-
-    def test_falls_back_to_plex_when_db_empty(self, tmp_path):
-        """An unpopulated DB must not be treated as authoritative."""
-        client, mock_library = self._client()
-        empty_db = self._make_db(tmp_path, populate=False)
-
-        mock_library.search.return_value = [_make_plex_track()]
-
-        with patch("backend.plex_client.get_track_db", return_value=empty_db):
-            results = client.get_tracks_by_filters(genres=["Rock"])
-
-        mock_library.search.assert_called_once()
-        assert [t.title for t in results] == ["Fake Plastic Trees"]
-
-    def test_falls_back_to_plex_when_db_absent(self):
-        client, mock_library = self._client()
-        mock_library.search.return_value = [_make_plex_track()]
-
-        with patch("backend.plex_client.get_track_db", return_value=None):
-            results = client.get_tracks_by_filters(genres=["Rock"])
-
-        mock_library.search.assert_called_once()
-        assert len(results) == 1
-
-    def test_db_available_reflects_db_first_gate(self, tmp_path):
-        """db_available mirrors the DB-first gate used by the query methods."""
-        client, _ = self._client()
-
-        populated = tmp_path / "populated"
-        populated.mkdir()
-        with patch("backend.plex_client.get_track_db", return_value=self._make_db(populated)):
-            assert client.db_available() is True
-
-        empty = tmp_path / "empty"
-        empty.mkdir()
-        with patch("backend.plex_client.get_track_db", return_value=self._make_db(empty, populate=False)):
-            assert client.db_available() is False
-
-        with patch("backend.plex_client.get_track_db", return_value=None):
-            assert client.db_available() is False
-
-    def test_sync_track_db_populates_metadata(self, tmp_path):
-        client, mock_library = self._client()
-        db = self._make_db(tmp_path, populate=False)
-        mock_library.search.return_value = [_make_plex_track()]
-
-        with patch("backend.plex_client.get_track_db", return_value=db):
-            count = client.sync_track_db(force=True)
-
-        assert count == 1
-        assert db.get_track_count() == 1
-        meta = db.get_metadata("123")
-        assert meta["user_rating"] == 9
-        assert meta["play_count"] == 5
-        assert meta["last_played"] is not None
-        assert meta["is_live"] is False
-        assert set(meta["genres"]) == {"Alternative", "Rock"}
-
-    def test_db_path_carries_precomputed_live_flag(self, tmp_path):
-        """DB reads expose the sync-time flag and honour exclude_live in SQL."""
-        client, mock_library = self._client()
-        db = self._make_db(tmp_path)
-        db.upsert_tracks(
-            [
-                Track(
-                    rating_key="9",
-                    title="Live Cut",
-                    artist="Oasis",
-                    album="Live at Knebworth 1996",
-                    duration_ms=200000,
-                    year=1996,
-                    genres=["Rock"],
-                )
-            ],
-            is_live_flags=[True],
+        playback_client = self._make_mock_client(
+            machine_id="client1",
+            title="Plexamp",
+            protocol_capabilities="timeline,playback,navigation",
+        )
+        non_playback_client = self._make_mock_client(
+            machine_id="client2",
+            title="Plex Web",
+            protocol_capabilities="timeline,navigation",
         )
 
-        with patch("backend.plex_client.get_track_db", return_value=db):
-            with_live = client.get_tracks_by_filters(genres=["Rock"], exclude_live=False)
-            without_live = client.get_tracks_by_filters(genres=["Rock"], exclude_live=True)
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.clients.return_value = [playback_client, non_playback_client]
 
-        flags = {t.rating_key: t.is_live for t in with_live}
-        assert flags["9"] is True
-        assert flags["1"] is False
-        assert "9" not in {t.rating_key for t in without_live}
-        mock_library.search.assert_not_called()
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            clients = plex.get_clients()
 
-    def test_db_path_does_not_recompute_live(self, tmp_path):
-        """Serving from the DB must not run the live-detection regex."""
-        client, _ = self._client()
-        db = self._make_db(tmp_path)
+        assert len(clients) == 1
+        assert clients[0].client_id == "client1"
+        assert clients[0].name == "Plexamp"
 
-        with patch("backend.plex_client.get_track_db", return_value=db):
-            with patch("backend.plex_client.is_live_version") as spy:
-                results = client.get_tracks_by_filters(genres=["Rock"])
-
-        assert results
-        spy.assert_not_called()
-
-    def test_api_fallback_detects_live_once_per_track(self):
-        """On the API path, detection runs once per fetched track and is stored."""
-        client, mock_library = self._client()
-        mock_library.search.return_value = [
-            _make_plex_track(rating_key="1", title="Song", album="Some Album"),
-            _make_plex_track(rating_key="2", title="Song", album="Live at Foo"),
-        ]
-
-        with patch("backend.plex_client.get_track_db", return_value=None):
-            with patch(
-                "backend.plex_client.is_live_version", wraps=is_live_version
-            ) as spy:
-                results = client.get_tracks_by_filters(genres=["Rock"])
-
-        assert [t.rating_key for t in results] == ["1"]
-        assert results[0].is_live is False
-        assert spy.call_count == 2  # once per fetched track
-
-    def test_sync_track_db_skips_when_fresh(self, tmp_path):
-        client, mock_library = self._client()
-        db = self._make_db(tmp_path)  # populated + last_sync = now
-
-        with patch("backend.plex_client.get_track_db", return_value=db):
-            count = client.sync_track_db()
-
-        assert count == 0
-        mock_library.search.assert_not_called()
-
-    def test_ensure_synced_triggers_when_stale(self, tmp_path):
-        client, mock_library = self._client()
-        db = self._make_db(tmp_path)
-        db.set_last_sync(time.time() - 1000)
-        mock_library.search.return_value = [_make_plex_track()]
-
-        with patch("backend.plex_client.get_track_db", return_value=db):
-            count = client.ensure_synced(max_age_seconds=10)
-
-        assert count == 1
-        mock_library.search.assert_called_once()
-
-    def test_sync_prunes_removed_tracks(self, tmp_path):
-        """Tracks gone from Plex are removed from the mirror."""
-        client, mock_library = self._client()
-        db = self._make_db(tmp_path)  # has keys 1 and 2
-        mock_library.search.return_value = [_make_plex_track(rating_key="1")]
-
-        with patch("backend.plex_client.get_track_db", return_value=db):
-            client.sync_track_db(force=True)
-
-        assert db.get_track_count() == 1
-        assert db.get_metadata("2") is None
-
-
-class TestSyncPagination:
-    """A full sync streams the library in pages instead of buffering it."""
-
-    def _client(self):
+    def test_get_clients_detects_playing_state(self):
+        """Should set is_playing=True when client is actively playing media."""
         from backend.plex_client import PlexClient
 
-        mock_library = MagicMock()
+        playing_client = self._make_mock_client(
+            machine_id="player1",
+            title="Bedroom Speaker",
+            is_playing=True,
+        )
+
         mock_server = MagicMock()
-        mock_server.library.section.return_value = mock_library
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.clients.return_value = [playing_client]
+
         with patch("backend.plex_client.PlexServer", return_value=mock_server):
-            client = PlexClient("http://localhost:32400", "token", "Music")
-        return client, mock_library
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            clients = plex.get_clients()
 
-    def _library(self, total):
-        """A fake Plex library that serves tracks in container-sized slices."""
-        tracks = [
-            _make_plex_track(rating_key=str(i), title=f"Track {i}") for i in range(total)
-        ]
-        calls = []
+        assert len(clients) == 1
+        assert clients[0].is_playing is True
 
-        def search(libtype=None, container_start=0, container_size=None, maxresults=None, **kw):
-            calls.append((container_start, container_size, maxresults))
-            size = maxresults or container_size or 0
-            return tracks[container_start:container_start + size]
+    def test_get_clients_detects_idle_state(self):
+        """Should set is_playing=False when client is idle."""
+        from backend.plex_client import PlexClient
 
-        return search, calls
+        idle_client = self._make_mock_client(
+            machine_id="idle1",
+            title="Kitchen Speaker",
+            is_playing=False,
+        )
 
-    def _make_db(self, tmp_path):
-        from backend.track_db import TrackDB
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.clients.return_value = [idle_client]
 
-        return TrackDB(tmp_path / "plex.db")
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            clients = plex.get_clients()
 
-    @pytest.mark.parametrize(
-        "total,expected_batches",
-        [
-            (1200, [500, 500, 200]),  # trailing short page ends the walk
-            (1000, [500, 500]),       # exact multiple needs one empty page
-            (0, []),                  # empty library: no pages written
-        ],
-    )
-    def test_sync_writes_one_page_at_a_time(self, tmp_path, total, expected_batches):
-        """Each page is upserted as it arrives, not accumulated."""
-        client, mock_library = self._client()
-        mock_library.search.side_effect, calls = self._library(total)
-        db = self._make_db(tmp_path)
+        assert len(clients) == 1
+        assert clients[0].is_playing is False
 
-        batches = []
-        real_upsert = db.upsert_tracks
+    def test_get_clients_skips_unresponsive_clients(self):
+        """Should exclude clients where isPlayingMedia() raises an exception."""
+        from backend.plex_client import PlexClient
 
-        def spy_upsert(tracks, **kwargs):
-            batches.append(len(tracks))
-            return real_upsert(tracks, **kwargs)
+        responsive_client = self._make_mock_client(
+            machine_id="good1",
+            title="Working Player",
+        )
+        unresponsive_client = self._make_mock_client(
+            machine_id="bad1",
+            title="Broken Player",
+        )
+        unresponsive_client.isPlayingMedia.side_effect = Exception(
+            "Connection timed out"
+        )
 
-        with patch.object(db, "upsert_tracks", side_effect=spy_upsert):
-            with patch("backend.plex_client.get_track_db", return_value=db):
-                count = client.sync_track_db(force=True)
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.clients.return_value = [responsive_client, unresponsive_client]
 
-        assert count == total
-        assert db.get_track_count() == total
-        assert batches == expected_batches
-        # Every request asked for exactly one container-sized page.
-        assert all(size == 500 and maxresults == 500 for _, size, maxresults in calls)
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            clients = plex.get_clients()
 
-    def test_sync_page_size_is_configurable(self, tmp_path):
-        """page_size drives container_start/container_size and the batch split."""
-        client, mock_library = self._client()
-        mock_library.search.side_effect, calls = self._library(5)
-        db = self._make_db(tmp_path)
+        # Only the responsive client should be returned
+        assert len(clients) == 1
+        assert clients[0].client_id == "good1"
+        assert clients[0].name == "Working Player"
 
-        with patch("backend.plex_client.get_track_db", return_value=db):
-            count = client.sync_track_db(force=True, page_size=2)
+    def test_get_clients_maps_correct_fields(self):
+        """Should map machineIdentifier->client_id, title->name, product, platform."""
+        from backend.plex_client import PlexClient
+        from backend.models import PlexClientInfo
 
-        assert count == 5
-        assert [start for start, _, _ in calls] == [0, 2, 4]
-        assert all(size == 2 and maxresults == 2 for _, size, maxresults in calls)
+        client = self._make_mock_client(
+            machine_id="xyz789",
+            title="Eric's iPhone",
+            product="Plexamp",
+            platform="iOS",
+            is_playing=False,
+        )
 
-    def test_sync_rejects_nonpositive_page_size(self, tmp_path):
-        client, mock_library = self._client()
-        db = self._make_db(tmp_path)
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.clients.return_value = [client]
 
-        with patch("backend.plex_client.get_track_db", return_value=db):
-            with pytest.raises(ValueError):
-                client.sync_track_db(force=True, page_size=0)
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            clients = plex.get_clients()
 
-        mock_library.search.assert_not_called()
+        assert len(clients) == 1
+        result = clients[0]
+        assert isinstance(result, PlexClientInfo)
+        assert result.client_id == "xyz789"
+        assert result.name == "Eric's iPhone"
+        assert result.product == "Plexamp"
+        assert result.platform == "iOS"
+        assert result.is_playing is False
 
-    def test_sync_failure_mid_way_does_not_mark_synced(self, tmp_path):
-        """A failed page returns 0 and leaves the sync retryable, not half-marked."""
-        client, mock_library = self._client()
-        db = self._make_db(tmp_path)
 
-        first_page = [_make_plex_track(rating_key=str(i)) for i in range(500)]
-        calls = []
+class TestPlexClientPlayQueue:
+    """Tests for play_queue() method that sends tracks to a Plex client."""
 
-        def search(libtype=None, container_start=0, container_size=None, maxresults=None, **kw):
-            calls.append(container_start)
-            if container_start == 0:
-                return first_page
-            raise ConnectionError("plex went away")
+    def _make_mock_client(
+        self,
+        machine_id: str = "abc123",
+        title: str = "Living Room TV",
+        product: str = "Plexamp",
+        protocol_capabilities: str = "timeline,playback,navigation",
+    ) -> MagicMock:
+        """Helper to create a mock Plex client resource."""
+        client = MagicMock()
+        client.machineIdentifier = machine_id
+        client.title = title
+        client.product = product
+        client.protocolCapabilities = protocol_capabilities
+        return client
 
-        mock_library.search.side_effect = search
+    def test_play_queue_replace_mode(self):
+        """Should create a PlayQueue and send it to the client in replace mode."""
+        from backend.plex_client import PlexClient
 
-        with patch("backend.plex_client.get_track_db", return_value=db):
-            assert client.sync_track_db(force=True) == 0
+        # Set up mock tracks returned by server.fetchItem()
+        mock_track1 = MagicMock()
+        mock_track1.ratingKey = 101
+        mock_track2 = MagicMock()
+        mock_track2.ratingKey = 102
 
-        # Page one landed, but the sync is not marked fresh so it is retried.
-        assert calls == [0, 500]
-        assert db.get_last_sync() is None
+        # Set up mock client
+        target_client = self._make_mock_client(
+            machine_id="target1",
+            title="Plexamp Mobile",
+            product="Plexamp",
+        )
+
+        mock_play_queue = MagicMock()
+
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.clients.return_value = [target_client]
+        mock_server.fetchItem.side_effect = lambda key: {
+            101: mock_track1,
+            102: mock_track2,
+        }[key]
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            with patch("backend.plex_client.PlayQueue") as MockPlayQueue:
+                MockPlayQueue.create.return_value = mock_play_queue
+
+                plex = PlexClient("http://localhost:32400", "token", "Music")
+                result = plex.play_queue(
+                    rating_keys=["101", "102"],
+                    client_id="target1",
+                    mode="replace",
+                )
+
+        # Verify proxyThroughServer was called
+        target_client.proxyThroughServer.assert_called_once()
+
+        # Verify PlayQueue.create was called with correct arguments
+        MockPlayQueue.create.assert_called_once()
+        create_call = MockPlayQueue.create.call_args
+        # Check items contain both tracks
+        assert mock_track1 in create_call.kwargs.get("items", create_call[1].get("items", []))
+        assert mock_track2 in create_call.kwargs.get("items", create_call[1].get("items", []))
+        # Check startItem is the first track
+        start_item = create_call.kwargs.get("startItem", create_call[1].get("startItem"))
+        assert start_item == mock_track1
+
+        # Verify playMedia was called with the play queue
+        target_client.playMedia.assert_called_once_with(mock_play_queue)
+
+        # Verify return values
+        assert result["success"] is True
+        assert result["client_name"] == "Plexamp Mobile"
+        assert result["client_product"] == "Plexamp"
+        assert result["tracks_queued"] == 2
+
+    def test_play_queue_play_next_mode(self):
+        """Should add tracks to existing queue in reversed order with playNext=True."""
+        from backend.plex_client import PlexClient
+
+        # Set up mock tracks
+        mock_track1 = MagicMock()
+        mock_track1.ratingKey = 201
+        mock_track2 = MagicMock()
+        mock_track2.ratingKey = 202
+        mock_track3 = MagicMock()
+        mock_track3.ratingKey = 203
+
+        # Set up mock client with active play queue
+        target_client = self._make_mock_client(
+            machine_id="target2",
+            title="Desktop Player",
+            product="Plex for Mac",
+        )
+        # timelines() returns list of timeline entries; music entry has playQueueID
+        music_entry = MagicMock()
+        music_entry.type = "music"
+        music_entry.playQueueID = 42
+        target_client.timelines.return_value = [music_entry]
+
+        mock_play_queue = MagicMock()
+
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.clients.return_value = [target_client]
+        mock_server.fetchItem.side_effect = lambda key: {
+            201: mock_track1,
+            202: mock_track2,
+            203: mock_track3,
+        }[key]
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            with patch("backend.plex_client.PlayQueue") as MockPlayQueue:
+                MockPlayQueue.get.return_value = mock_play_queue
+
+                plex = PlexClient("http://localhost:32400", "token", "Music")
+                result = plex.play_queue(
+                    rating_keys=["201", "202", "203"],
+                    client_id="target2",
+                    mode="play_next",
+                )
+
+        # Verify proxyThroughServer was called
+        target_client.proxyThroughServer.assert_called_once()
+
+        # Verify PlayQueue.get was called with correct playQueueID
+        MockPlayQueue.get.assert_called_once()
+        get_call = MockPlayQueue.get.call_args
+        assert get_call[0][1] == 42 or get_call[1].get("playQueueID") == 42 or get_call.args[1] == 42
+
+        # Verify tracks were added in reversed order with playNext=True, refresh=True
+        add_calls = mock_play_queue.addItem.call_args_list
+        assert len(add_calls) == 3
+        # Reversed order: track3, track2, track1
+        assert add_calls[0][0][0] == mock_track3
+        assert add_calls[1][0][0] == mock_track2
+        assert add_calls[2][0][0] == mock_track1
+        # Each call should have playNext=True; only last call has refresh=True
+        for i, call in enumerate(add_calls):
+            assert call[1].get("playNext") is True
+            expected_refresh = (i == len(add_calls) - 1)
+            assert call[1].get("refresh") is expected_refresh
+
+        # Verify return values
+        assert result["success"] is True
+        assert result["client_name"] == "Desktop Player"
+        assert result["client_product"] == "Plex for Mac"
+        assert result["tracks_queued"] == 3
+
+    def test_play_queue_offline_client(self):
+        """Should return success=False with error when client is offline."""
+        from backend.plex_client import PlexClient
+
+        mock_track = MagicMock()
+        mock_track.ratingKey = 301
+
+        target_client = self._make_mock_client(
+            machine_id="offline1",
+            title="Offline Player",
+            product="Plexamp",
+        )
+        # Simulate offline client - playMedia raises requests ConnectionError
+        target_client.playMedia.side_effect = RequestsConnectionError("Connection refused")
+
+        mock_play_queue = MagicMock()
+
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.clients.return_value = [target_client]
+        mock_server.fetchItem.return_value = mock_track
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            with patch("backend.plex_client.PlayQueue") as MockPlayQueue:
+                MockPlayQueue.create.return_value = mock_play_queue
+
+                plex = PlexClient("http://localhost:32400", "token", "Music")
+                result = plex.play_queue(
+                    rating_keys=["301"],
+                    client_id="offline1",
+                    mode="replace",
+                )
+
+        assert result["success"] is False
+        assert "went offline" in result["error"]
+
+    def test_play_queue_client_not_found(self):
+        """Should return error when target client_id is not among connected clients."""
+        from backend.plex_client import PlexClient
+
+        # Create a client with a different machineIdentifier than what we'll request
+        other_client = self._make_mock_client(
+            machine_id="other_machine",
+            title="Other Player",
+        )
+
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.clients.return_value = [other_client]
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            result = plex.play_queue(
+                rating_keys=["100"],
+                client_id="nonexistent_id",
+                mode="replace",
+            )
+
+        assert result["success"] is False
+        assert result["error"] is not None
+
+
+class TestPlexClientGetPlaylists:
+    """Tests for get_playlists() method that returns audio playlists."""
+
+    def _make_mock_playlist(self, rating_key=1, title="Test Playlist", leaf_count=10, smart=False, radio=False):
+        """Helper to create a mock Plex playlist object."""
+        playlist = MagicMock()
+        playlist.ratingKey = rating_key
+        playlist.title = title
+        playlist.leafCount = leaf_count
+        playlist.smart = smart
+        playlist.radio = radio
+        return playlist
+
+    def test_get_playlists_returns_audio_playlists(self):
+        """Should return audio playlists as PlexPlaylistInfo objects."""
+        from backend.plex_client import PlexClient
+
+        pl1 = self._make_mock_playlist(rating_key=100, title="Road Trip Mix", leaf_count=25)
+        pl2 = self._make_mock_playlist(rating_key=200, title="Chill Vibes", leaf_count=18)
+
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.playlists.return_value = [pl1, pl2]
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            playlists = plex.get_playlists()
+
+        # Verify server.playlists was called for audio type
+        mock_server.playlists.assert_called_once_with(playlistType="audio")
+
+        assert len(playlists) == 2
+        # Check types and field mapping
+        for p in playlists:
+            assert isinstance(p, PlexPlaylistInfo)
+
+        # Sorted alphabetically: Chill Vibes, Road Trip Mix
+        assert playlists[0].rating_key == "200"
+        assert playlists[0].title == "Chill Vibes"
+        assert playlists[0].track_count == 18
+        assert playlists[1].rating_key == "100"
+        assert playlists[1].title == "Road Trip Mix"
+        assert playlists[1].track_count == 25
+
+    def test_get_playlists_sorted_by_title(self):
+        """Should return playlists sorted alphabetically by title."""
+        from backend.plex_client import PlexClient
+
+        pl_z = self._make_mock_playlist(rating_key=1, title="Zen Garden", leaf_count=5)
+        pl_a = self._make_mock_playlist(rating_key=2, title="Afternoon Jazz", leaf_count=12)
+        pl_m = self._make_mock_playlist(rating_key=3, title="Morning Run", leaf_count=20)
+
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.playlists.return_value = [pl_z, pl_a, pl_m]
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            playlists = plex.get_playlists()
+
+        titles = [p.title for p in playlists]
+        assert titles == ["Afternoon Jazz", "Morning Run", "Zen Garden"]
+
+    def test_get_playlists_empty(self):
+        """Should return empty list when server has no audio playlists."""
+        from backend.plex_client import PlexClient
+
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.playlists.return_value = []
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            playlists = plex.get_playlists()
+
+        assert playlists == []
+
+    def test_get_playlists_excludes_smart_and_radio(self):
+        """Should exclude smart playlists and radio playlists from results."""
+        from backend.plex_client import PlexClient
+
+        regular = self._make_mock_playlist(rating_key=1, title="My Mix", leaf_count=10)
+        smart = self._make_mock_playlist(rating_key=2, title="Favorite Songs", leaf_count=50, smart=True)
+        radio = self._make_mock_playlist(rating_key=3, title="Radio Station", leaf_count=0, radio=True)
+
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.playlists.return_value = [regular, smart, radio]
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            playlists = plex.get_playlists()
+
+        assert len(playlists) == 1
+        assert playlists[0].title == "My Mix"
+
+
+class TestPlexClientUpdatePlaylist:
+    """Tests for update_playlist() method that modifies existing playlists."""
+
+    def _make_mock_playlist(self, rating_key=1, title="Test Playlist", leaf_count=10, items=None):
+        """Helper to create a mock Plex playlist object."""
+        playlist = MagicMock()
+        playlist.ratingKey = rating_key
+        playlist.title = title
+        playlist.leafCount = leaf_count
+        playlist.items.return_value = items or []
+        return playlist
+
+    def _make_mock_track(self, rating_key):
+        """Helper to create a mock Plex track object."""
+        track = MagicMock()
+        track.ratingKey = int(rating_key)
+        return track
+
+    def test_update_playlist_replace_mode(self):
+        """Should remove existing items and add new ones in replace mode."""
+        from backend.plex_client import PlexClient
+
+        # Existing tracks in playlist
+        existing_track_a = self._make_mock_track(50)
+        existing_track_b = self._make_mock_track(51)
+
+        # The playlist we'll fetch
+        mock_playlist = self._make_mock_playlist(
+            rating_key=10,
+            title="My Playlist",
+            leaf_count=2,
+            items=[existing_track_a, existing_track_b],
+        )
+
+        # New tracks to add
+        new_track_1 = self._make_mock_track(101)
+        new_track_2 = self._make_mock_track(102)
+        new_track_3 = self._make_mock_track(103)
+
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.fetchItem.side_effect = lambda key: {
+            10: mock_playlist,
+            101: new_track_1,
+            102: new_track_2,
+            103: new_track_3,
+        }[key]
+        mock_server.machineIdentifier = "server123"
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            result = plex.update_playlist(
+                playlist_id="10",
+                rating_keys=["101", "102", "103"],
+                mode="replace",
+            )
+
+        # Verify existing items were removed
+        mock_playlist.removeItems.assert_called_once_with([existing_track_a, existing_track_b])
+        # Verify new items were added
+        mock_playlist.addItems.assert_called_once_with([new_track_1, new_track_2, new_track_3])
+
+        assert result["success"] is True
+        assert result["tracks_added"] == 3
+
+    def test_update_playlist_append_mode_deduplicates(self):
+        """Should skip tracks that already exist in the playlist when appending."""
+        from backend.plex_client import PlexClient
+
+        # Existing tracks: 101 and 102 already in playlist
+        existing_track_101 = self._make_mock_track(101)
+        existing_track_102 = self._make_mock_track(102)
+
+        mock_playlist = self._make_mock_playlist(
+            rating_key=20,
+            title="Append Test",
+            leaf_count=2,
+            items=[existing_track_101, existing_track_102],
+        )
+
+        # New tracks to add: 101 (dup), 103 (new), 102 (dup), 104 (new)
+        new_track_101 = self._make_mock_track(101)
+        new_track_102 = self._make_mock_track(102)
+        new_track_103 = self._make_mock_track(103)
+        new_track_104 = self._make_mock_track(104)
+
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.fetchItem.side_effect = lambda key: {
+            20: mock_playlist,
+            101: new_track_101,
+            102: new_track_102,
+            103: new_track_103,
+            104: new_track_104,
+        }[key]
+        mock_server.machineIdentifier = "server123"
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            result = plex.update_playlist(
+                playlist_id="20",
+                rating_keys=["101", "103", "102", "104"],
+                mode="append",
+            )
+
+        # Only non-duplicate tracks (103, 104) should be added
+        mock_playlist.addItems.assert_called_once()
+        added_items = mock_playlist.addItems.call_args[0][0]
+        added_keys = [t.ratingKey for t in added_items]
+        assert 103 in added_keys
+        assert 104 in added_keys
+        assert 101 not in added_keys
+        assert 102 not in added_keys
+
+        assert result["success"] is True
+        assert result["tracks_added"] == 2
+        assert result["duplicates_skipped"] == 2
+
+    def test_update_playlist_scratch_creates_if_not_found(self):
+        """Should create 'MediaSage - Now Playing' when __scratch__ and no existing match."""
+        from backend.plex_client import PlexClient
+
+        new_track_1 = self._make_mock_track(201)
+        new_track_2 = self._make_mock_track(202)
+
+        created_playlist = self._make_mock_playlist(
+            rating_key=999,
+            title="MediaSage - Now Playing",
+            leaf_count=2,
+        )
+
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        # No existing "MediaSage - Now Playing" playlist
+        mock_server.playlists.return_value = []
+        mock_server.createPlaylist.return_value = created_playlist
+        mock_server.fetchItem.side_effect = lambda key: {
+            201: new_track_1,
+            202: new_track_2,
+        }[key]
+        mock_server.machineIdentifier = "server123"
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            result = plex.update_playlist(
+                playlist_id="__scratch__",
+                rating_keys=["201", "202"],
+                mode="replace",
+            )
+
+        # Verify createPlaylist was called with correct title and track items
+        mock_server.createPlaylist.assert_called_once()
+        create_call = mock_server.createPlaylist.call_args
+        # Title should be "MediaSage - Now Playing" — check positional or keyword arg
+        call_title = create_call[0][0] if create_call[0] else create_call[1].get("title")
+        assert call_title == "MediaSage - Now Playing"
+
+        assert result["success"] is True
+
+    def test_update_playlist_scratch_uses_existing(self):
+        """Should reuse existing 'MediaSage - Now Playing' playlist for __scratch__."""
+        from backend.plex_client import PlexClient
+
+        existing_scratch = self._make_mock_playlist(
+            rating_key=500,
+            title="MediaSage - Now Playing",
+            leaf_count=5,
+            items=[self._make_mock_track(1), self._make_mock_track(2)],
+        )
+
+        new_track = self._make_mock_track(301)
+
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        # Return existing scratch playlist
+        mock_server.playlists.return_value = [existing_scratch]
+        mock_server.fetchItem.side_effect = lambda key: {
+            500: existing_scratch,
+            301: new_track,
+        }[key]
+        mock_server.machineIdentifier = "server123"
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            result = plex.update_playlist(
+                playlist_id="__scratch__",
+                rating_keys=["301"],
+                mode="replace",
+            )
+
+        # Should NOT create a new playlist
+        mock_server.createPlaylist.assert_not_called()
+        # Should use the existing playlist (fetch it by ratingKey 500)
+        assert result["success"] is True
+
+    def test_update_playlist_tracks_skipped_on_fetch_failure(self):
+        """Should count tracks that fail to fetch and report them as skipped."""
+        from backend.plex_client import PlexClient
+
+        good_track = self._make_mock_track(401)
+        mock_playlist = self._make_mock_playlist(
+            rating_key=30,
+            title="Skip Test",
+            leaf_count=0,
+            items=[],
+        )
+
+        def fetch_item_side_effect(key):
+            if key == 30:
+                return mock_playlist
+            if key == 401:
+                return good_track
+            raise Exception(f"Track {key} not found")
+
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = MagicMock()
+        mock_server.fetchItem.side_effect = fetch_item_side_effect
+        mock_server.machineIdentifier = "server123"
+
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            plex = PlexClient("http://localhost:32400", "token", "Music")
+            result = plex.update_playlist(
+                playlist_id="30",
+                rating_keys=["401", "402", "403"],
+                mode="replace",
+            )
+
+        assert result["success"] is True
+        assert result["tracks_added"] == 1
+        assert result["tracks_skipped"] == 2

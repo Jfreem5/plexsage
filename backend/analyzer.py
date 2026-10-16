@@ -15,7 +15,7 @@ from backend.models import (
 )
 from backend.plex_client import get_plex_client
 from backend.prompt_classifier import classify_prompt
-from backend.track_db import get_track_db
+from backend import library_cache
 
 logger = logging.getLogger(__name__)
 
@@ -193,12 +193,42 @@ def _parse_dimensions(data: dict[str, Any]) -> list[Dimension]:
     ]
 
 
+def _analysis_model(llm_client) -> str:
+    """Return the configured analysis model name ("" when unknown)."""
+    return str(getattr(getattr(llm_client, "config", None), "model_analysis", "") or "")
+
+
+def _load_cached_dimensions(
+    rating_key: str, model: str, fingerprint: str
+) -> list[dict[str, Any]] | None:
+    """Read cached dimensions, treating any cache failure as a miss."""
+    try:
+        return library_cache.get_dimensions(
+            rating_key, model=model, fingerprint=fingerprint
+        )
+    except Exception:
+        logger.warning("Dimension cache unavailable for track %s", rating_key, exc_info=True)
+        return None
+
+
+def _store_cached_dimensions(
+    rating_key: str, dimensions: list[dict[str, Any]], model: str, fingerprint: str
+) -> None:
+    """Best-effort write of dimensions to the local cache."""
+    try:
+        library_cache.save_dimensions(
+            rating_key, dimensions, model=model, fingerprint=fingerprint
+        )
+    except Exception:
+        logger.warning("Failed to cache dimensions for track %s", rating_key, exc_info=True)
+
+
 def analyze_track(track: Track, use_cache: bool = True) -> AnalyzeTrackResponse:
     """Analyze a seed track to extract musical dimensions.
 
-    Results are cached in the local TrackDB keyed by rating key, analysis
-    model, and a metadata fingerprint. Re-analyzing the same track with the
-    same model costs zero tokens.
+    Results are cached in the local library database keyed by rating key,
+    analysis model, and a metadata fingerprint. Re-analyzing the same track
+    with the same model costs zero tokens.
 
     Args:
         track: Track to analyze
@@ -217,15 +247,10 @@ def analyze_track(track: Track, use_cache: bool = True) -> AnalyzeTrackResponse:
         raise RuntimeError("LLM client not initialized")
 
     fingerprint = _track_fingerprint(track)
-    db = get_track_db() if use_cache else None
-    model = ""
+    model = _analysis_model(llm_client)
 
-    if db is not None:
-        model = str(getattr(getattr(llm_client, "config", None), "model_analysis", "") or "")
-
-        cached = db.get_dimensions(
-            track.rating_key, model=model, fingerprint=fingerprint
-        )
+    if use_cache:
+        cached = _load_cached_dimensions(track.rating_key, model, fingerprint)
         if cached:
             logger.info("Dimension cache hit for track %s (%s)", track.rating_key, model)
             return AnalyzeTrackResponse(
@@ -254,16 +279,13 @@ Identify 5-7 specific musical dimensions that make this track distinctive."""
 
     dimensions = _parse_dimensions(data)
 
-    if db is not None and dimensions:
-        try:
-            db.save_dimensions(
-                track.rating_key,
-                [d.model_dump() for d in dimensions],
-                model=model,
-                fingerprint=fingerprint,
-            )
-        except Exception:
-            logger.exception("Failed to cache dimensions for track %s", track.rating_key)
+    if use_cache and dimensions:
+        _store_cached_dimensions(
+            track.rating_key,
+            [d.model_dump() for d in dimensions],
+            model,
+            fingerprint,
+        )
 
     return AnalyzeTrackResponse(
         track=track,

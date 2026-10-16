@@ -10,14 +10,17 @@
 | File | Purpose | Key Exports |
 |------|---------|-------------|
 | `main.py` | FastAPI app, all HTTP routes, lifespan, static serving | `app` |
-| `config.py` | Config loading (env → user yaml → base yaml → defaults) | `get_config`, `update_config_values`, `refresh_config` |
-| `models.py` | All Pydantic models (entities, config, API req/resp, Ollama) | `Track`, `AppConfig`, `LLMConfig`, `PlexConfig`, request/response models |
-| `plex_client.py` | Plex server client, library queries, playlist creation, caching | `PlexClient`, `get_plex_client`, `init_plex_client`, `TrackCache` |
-| `track_db.py` | Local SQLite mirror of the library (filtering, FTS search, stats) | `TrackDB`, `get_track_db`, `init_track_db` |
+| `config.py` | Config loading (env → user yaml → base yaml → defaults) | `get_config`, `update_config_values`, `load_user_yaml_config`, `save_user_config` |
+| `models.py` | All Pydantic models (entities, config, API req/resp, library cache, recommend, Ollama) | `Track`, `AppConfig`, `LLMConfig`, `PlexConfig`, request/response models |
+| `plex_client.py` | Plex server client, library queries, playlist/queue creation, art, TTL cache | `PlexClient`, `get_plex_client`, `init_plex_client`, `TrackCache`, `is_live_version` |
+| `library_cache.py` | Local SQLite cache: library mirror, sync progress, filters/search/stats, saved results, seed-track dimensions | `sync_library`, `get_tracks_by_filters`, `count_tracks_by_filters`, `save_result`, `get_dimensions`, `save_dimensions`, `get_metadata_batch` |
 | `llm_client.py` | Unified LLM client (Anthropic/OpenAI/Gemini/Ollama/custom), cost & context helpers | `LLMClient`, `get_llm_client`, `init_llm_client`, `estimate_cost_for_model` |
-| `prompt_classifier.py` | Local prompt → genre/decade classification (keyword rules + hashing embeddings); LLM fallback trigger | `classify_prompt`, `PromptClassification`, `MOOD_GENRE_MAP`, `DECADE_HINTS` |
-| `analyzer.py` | Prompt → filter suggestions (local first, LLM fallback); seed track → dimension extraction | `analyze_prompt`, `analyze_track` |
-| `generator.py` | Playlist generation (sync + SSE streaming), exact + trigram-pruned fuzzy track matching | `generate_playlist`, `generate_playlist_stream`, `TrackMatcher` |
+| `prompt_classifier.py` | Local prompt → genre/decade classification (keyword rules + hashing embeddings); LLM fallback trigger | `classify_prompt`, `PromptClassification`, `extract_genre_hints`, `extract_decade_hints` |
+| `analyzer.py` | Prompt → filter suggestions (local first, LLM fallback); seed track → dimension extraction (cached) | `analyze_prompt`, `analyze_track` |
+| `generator.py` | Streaming playlist generation, dynamic candidate budget, rule-based pre-ranking, fuzzy track matching | `generate_playlist_stream`, `compute_track_budget`, `pre_rank_tracks`, `_tracks_match` |
+| `recommender.py` | Album-recommendation pipeline (4 LLM calls) with in-memory session state | `RecommendationPipeline` |
+| `music_research.py` | MusicBrainz + Wikipedia lookups to ground pitches in verifiable facts | `MusicResearchClient` |
+| `version.py` | Version detection from git tags or env | `get_version` |
 | `__init__.py` | Package marker, version | `__version__` |
 
 ---
@@ -33,13 +36,18 @@ main.py (FastAPI routes)
     ├── config.py ──────────► AppConfig (Plex + LLM + Defaults)
     │
     ├── plex_client.py ─────► PlexClient (library queries, playlists, art)
-    │       ├── TrackCache (TTL in-memory cache for filtered results)
-    │       └── track_db.py ─► TrackDB (SQLite mirror: reads served locally)
+    │       └── TrackCache (TTL in-memory cache for filtered results)
+    │
+    ├── library_cache.py ───► SQLite cache (data/library_cache.db)
+    │       ├── tracks / sync_state / results / track_dimensions
+    │       └── served locally: filters, counts, search, stats, candidates
     │
     ├── llm_client.py ──────► LLMClient (provider-agnostic completion)
     │       ├── prompt_classifier.py  (keywords + embeddings, no LLM)
     │       ├── analyzer.py  (prompt analysis via classifier, LLM fallback; track dimensions)
-    │       └── generator.py (playlist generation, fuzzy matching)
+    │       ├── generator.py (streaming generation, budget, pre-rank, matching)
+    │       ├── recommender.py (album recommendation pipeline)
+    │       └── music_research.py (MusicBrainz/Wikipedia grounding)
     │
     └── models.py ──────────► Pydantic schemas (shared contracts)
 ```
@@ -51,21 +59,39 @@ main.py (FastAPI routes)
 | Method | Path | Handler | Description |
 |--------|------|---------|-------------|
 | GET | `/api/health` | `health_check` | Plex + LLM status |
+| GET | `/api/setup/status` | `setup_status` | First-run wizard state |
+| POST | `/api/setup/validate-plex` | `validate_plex` | Test Plex credentials |
+| POST | `/api/setup/validate-ai` | `validate_ai` | Test LLM credentials |
+| POST | `/api/setup/complete` | `setup_complete` | Persist wizard config |
 | GET | `/api/config` | `get_configuration` | Current config (no secrets) |
 | POST | `/api/config` | `update_configuration` | Update config, reinit clients |
 | GET | `/api/ollama/status` | `ollama_status` | Ollama connection check |
 | GET | `/api/ollama/models` | `ollama_models` | List Ollama models |
 | GET | `/api/ollama/model-info` | `ollama_model_info` | Model details (context window) |
-| GET | `/api/library/stats` | `get_library_stats` | Total tracks, genres, decades |
+| GET | `/api/library/status` | `get_library_status` | Cache status + sync progress |
+| POST | `/api/library/sync` | `trigger_library_sync` | Start a background library sync |
+| GET | `/api/library/stats` | `get_library_stats` | Total tracks, genres, decades (Plex) |
+| GET | `/api/library/stats/cached` | `get_library_stats_cached` | Genre/decade chips from the cache |
 | GET | `/api/library/search` | `search_library` | Search tracks by query |
-| POST | `/api/library/sync` | `sync_library` | Mirror Plex library into local SQLite DB |
 | POST | `/api/analyze/prompt` | `analyze_prompt` | Prompt → suggested filters |
-| POST | `/api/analyze/track` | `analyze_track` | Seed track → dimensions |
+| POST | `/api/analyze/track` | `analyze_track` | Seed track → dimensions (cached) |
 | POST | `/api/filter/preview` | `preview_filters` | Filter count + cost estimate |
-| POST | `/api/generate` | `generate_playlist` | Generate playlist (sync) |
 | POST | `/api/generate/stream` | `generate_playlist_sse` | Generate playlist (SSE) |
 | POST | `/api/playlist` | `save_playlist` | Save playlist to Plex |
+| POST | `/api/playlist/update` | `update_playlist` | Update an existing Plex playlist |
+| GET | `/api/plex/clients` | `list_plex_clients` | Available Plex players |
+| GET | `/api/plex/playlists` | `list_plex_playlists` | Existing Plex playlists |
+| POST | `/api/play-queue` | `play_queue` | Start playback on a Plex client |
+| GET | `/api/recommend/albums/preview` | `recommend_albums_preview` | Album candidates |
+| POST | `/api/recommend/analyze-prompt` | `recommend_analyze_prompt` | Recommend-mode prompt analysis |
+| POST | `/api/recommend/questions` | `recommend_questions` | Follow-up questions |
+| POST | `/api/recommend/switch-mode` | `recommend_switch_mode` | Switch recommendation mode |
+| POST | `/api/recommend/generate` | `recommend_generate` | Run the recommendation pipeline |
+| GET | `/api/results` | `list_results` | Saved playlist/result history |
+| GET | `/api/results/{result_id}` | `get_result` | One saved result |
+| DELETE | `/api/results/{result_id}` | `delete_result` | Delete a saved result |
 | GET | `/api/art/{rating_key}` | `get_album_art` | Album art proxy (hides token) |
+| GET | `/api/external-art` | `get_external_art` | Proxy external art (Cover Art Archive) |
 | GET | `/` | `serve_index` | Serve frontend `index.html` |
 | — | `/static` | — | Static file mount (frontend) |
 
@@ -83,16 +109,16 @@ User types prompt
          ├── confident? → return, 0 tokens   (method "rules" | "embeddings")
          └── low confidence → llm_client.analyze()  (method "llm")
   → User picks filters
-  → POST /api/filter/preview             (count + cost)
-  → POST /api/generate
-    → generator.generate_playlist()
-      → plex_client.get_tracks_by_filters()  (or random sample)
-      → TrackDB.sync_from_plex()             (only when the read fell back to Plex)
-      → generator.compute_track_budget()    (dynamic candidate count from prompt)
-      → generator.pre_rank_tracks()          (rules; uses prompt_classifier hints)
-      → llm_client.generate()              (selects tracks)
-      → TrackMatcher.match()               (exact, then trigram-pruned fuzzy)
-  → POST /api/playlist                    (save to Plex)
+  → POST /api/filter/preview               (count + cost; budget uses prompt)
+  → POST /api/generate/stream
+    → generator.generate_playlist_stream()
+      → library_cache.get_tracks_by_filters()  (or Plex / random sample)
+      → generator.compute_track_budget()     (dynamic candidate count)
+      → generator.pre_rank_tracks()          (rules; rating + recency from cache)
+      → llm_client.generate()                (selects tracks)
+      → _tracks_match()                      (rapidfuzz title/artist match)
+      → library_cache.save_result()          (history)
+  → POST /api/playlist                       (save to Plex)
 ```
 
 ### 2. Seed-Track Flow
@@ -100,28 +126,39 @@ User types prompt
 User picks a track
   → POST /api/analyze/track
     → analyzer.analyze_track()
-      → track_db.get_dimensions()          (cache hit? model + metadata fingerprint)
-      → llm_client.analyze()             (extracts 5-7 dimensions; cached in track_dimensions)
+      → library_cache.get_dimensions()       (hit? model + metadata fingerprint)
+      → llm_client.analyze()                 (extracts 5-7 dimensions; cached in track_dimensions)
   → User picks dimensions
-  → POST /api/generate (with seed_track)
-    → generator.generate_playlist()
-      → same as above, but prompt includes seed + dimensions
+  → POST /api/generate/stream (with seed_track)
+    → generator.generate_playlist_stream()
+      → same as above, but the prompt includes the seed + chosen dimensions
 ```
 
-### 3. Generation Paths (generator.py)
+### 3. Generation (generator.py)
 
-`generate_playlist()` (sync, `/api/generate`) and `generate_playlist_stream()`
-(SSE, `/api/generate/stream`) run the same shared stage,
-`_prepare_generation()`: fetch (a random sample when unfiltered, otherwise the
-5-minute filter cache) → mirror a Plex-served batch into `TrackDB` → size the
-budget (`compute_track_budget`) → pre-rank (`pre_rank_tracks`) → build the
-prompt. `_match_selections()` then resolves the LLM's picks. The streaming
-wrapper formats the progress events and yields them; the sync wrapper discards
-them via `_collect_preparation()`. The two paths can no longer drift.
+There is a single generation path, `generate_playlist_stream()` (SSE,
+`/api/generate/stream`). It emits `progress` events
+(`fetching → filtering → pre_ranking → preparing → ai_working → parsing →
+matching → narrative → complete`), batched `tracks` events (5 per event, to work
+around iOS Safari SSE buffering limits), a `narrative` event, and a final
+`complete` event (or `error`).
 
-`generate_playlist_stream()` emits
-`progress` (fetching | cache_hit → pre_ranking → preparing → ai_working →
-parsing → matching → complete) or `error` or `complete`.
+Candidates come from `_get_tracks_from_cache_or_plex()` (local cache first, Plex
+fallback), then `compute_track_budget()` sizes the pool and `pre_rank_tracks()`
+trims it locally before any tokens are spent.
+
+### 4. Library Sync (library_cache.py)
+
+```
+POST /api/library/sync  → background thread: library_cache.sync_library(plex_client)
+                        → progress polled via GET /api/library/status
+startup / migration     → automatic re-sync in the main.py lifespan
+```
+
+`sync_library()` walks albums/tracks in batches (`SYNC_BATCH_SIZE` = 500) and
+upserts each batch, so peak memory tracks the batch size rather than the whole
+library. Live detection (`_is_live_version`) is computed once per track at sync
+and stored in `tracks.is_live`.
 
 ---
 
@@ -147,25 +184,18 @@ parsing → matching → complete) or `error` or `complete`.
 | `anthropic` | `anthropic.Anthropic` | `messages.create()` |
 | `openai` | `openai.OpenAI` | `chat.completions.create()` |
 | `gemini` | `google.genai.Client` | Retry logic for truncation (MAX_TOKENS) |
-| `ollama` | `httpx` (direct) | `/api/generate`, 600s timeout |
+| `ollama` | `httpx` (direct) | `/api/generate`, long timeout |
 | `custom` | `openai.OpenAI` (base_url) | Any OpenAI-compatible endpoint |
 
 ### Helper Functions
 - `estimate_cost_for_model(model, in, out, config)` → USD (0 for local)
 - `get_max_tracks_for_model(model, config)` → max tracks from context window
-- `get_model_context_limit(model, config)` → tokens (128k fallback)
+- `get_model_context_limit(model, config)` → tokens
 - `get_model_cost(model, config)` → `{input, output}` per million tokens
 - `list_ollama_models(url)` / `get_ollama_model_info(url, name)` / `get_ollama_status(url)`
 
-### Cost Table (`MODEL_COSTS`)
-| Model | Input $/M | Output $/M |
-|-------|-----------|------------|
-| claude-sonnet-4-5 | 3.00 | 15.00 |
-| claude-haiku-4-5 | 0.25 | 1.25 |
-| gpt-4.1 | 2.00 | 8.00 |
-| gpt-4.1-mini | 0.40 | 1.60 |
-| gemini-2.5-pro | 1.25 | 5.00 |
-| gemini-2.5-flash | 0.075 | 0.30 |
+Responses are parsed with `json_repair` so slightly malformed LLM JSON still
+yields a usable object.
 
 ---
 
@@ -176,13 +206,15 @@ Local replacement for the LLM prompt-analysis call. Returns a
 
 | Stage | What it does | Method value |
 |-------|--------------|--------------|
-| Keyword rules | `MOOD_GENRE_MAP` (mood/activity/genre → genres) + `DECADE_HINTS` (era words → decades). Hints are mapped onto actual library genres via exact → substring → fuzzy (`difflib`). | `"rules"` |
-| Embeddings | Feature-hashed bag-of-words vectors (stdlib `hashlib`; word unigrams + bigrams). Prompt vs each library genre's `GENRE_DESCRIPTIONS` text, cosine similarity. Catches genre words rules don't know (e.g. "shoegaze"). | `"embeddings"` |
+| Keyword rules | Mood/activity/genre hint groups → genres + era words → decades. Hints are mapped onto actual library genres via exact → substring → fuzzy (`difflib`). | `"rules"` |
+| Embeddings | Feature-hashed bag-of-words vectors (stdlib `hashlib`; word unigrams + bigrams). Prompt vs each library genre description, cosine similarity. Catches genre words the rules don't know (e.g. "shoegaze"). | `"embeddings"` |
 | Fallback | Confidence below `CONFIDENCE_THRESHOLD` (0.55) → analyzer calls the LLM. | `"none"` → `"llm"` |
 
 - No external dependencies and no network calls; `_embed()` is the seam to drop in a real model later.
 - Confidence is based on the number of distinct prompt *keywords* that matched (or the top embedding similarity), so broad hint groups don't inflate it.
-- `generator.pre_rank_tracks()` reuses `extract_genre_hints` / `extract_decade_hints` from this module as the single source of truth for the hint dictionaries.
+- `generator.pre_rank_tracks()` and `generator._prompt_specificity()` reuse
+  `extract_genre_hints` / `extract_decade_hints` / `extract_genre_hint_groups`
+  from this module as the single source of truth for the hint dictionaries.
 
 ---
 
@@ -201,36 +233,34 @@ a floor and a ceiling using a 0-1 specificity score:
   filters; a bare mood/activity prompt stays low. `score 0 → ceiling`,
   `score 1 → floor`.
 
-Both `generate_playlist`/`generate_playlist_stream` and the
-`/api/filter/preview` endpoint (optional `prompt` field) call it, so the preview
-matches the real request. With no prompt or filters the ceiling is unchanged, so
-the seed flow behaves exactly as before.
+Both `generate_playlist_stream()` and the `/api/filter/preview` endpoint
+(optional `prompt` field) call it, so the preview matches the real request.
+
+---
+
+## Rule-Based Pre-Ranking (`generator.py`)
+
+`pre_rank_tracks()` scores the candidate pool and keeps the top `budget` tracks
+before the LLM sees them (total max = 100):
+
+1. **Genre match (0-40)** — overlap with prompt/filter genre hints (proportional,
+   plus a small partial/substring bonus for near misses).
+2. **Decade match (0-20)** — track year falls in a hinted decade.
+3. **User rating (0-25)** — `library_cache.get_metadata_batch()` `user_rating`.
+4. **Recency (0-15)** — exponential decay (72 h half-life) on `last_viewed_at`.
+
+Ties break on `rating_key` for deterministic ordering. If the pool is already
+within budget, the list is returned untouched (no metadata fetch).
 
 ---
 
 ## Track Matching (`generator.py`)
 
-Resolves the LLM's `{artist, title}` selections against the pre-ranked candidate
-list (`_match_selections()`, shared by both generation paths). `TrackMatcher`
-indexes the candidates **once per generation** (simplified
-title/artist strings, an exact-match dict, and a title-trigram inverted index),
-then resolves each selection in roughly `O(k)` instead of scanning all `n`
-tracks with `rapidfuzz`:
-
-1. **Exact match** — normalized `(artist, title)` lookup, including `&`/`and`
-   artist variants. O(1), resolves most selections.
-2. **Trigram candidates** — tracks sharing a title trigram with the selection,
-   fuzzy-compared via `_fuzzy_track_match()`. Titles are the blocking key because
-   the title must match first. When the overlap is too broad (more than ~25% of
-   candidates), it falls back to a linear scan, which still benefits from the
-   precomputed keys.
-3. **Full-scan fallback** — covers tracks trigrams didn't surface (e.g. titles
-   shorter than a trigram), so a genuine match is never dropped.
-
-`_tracks_match()` remains as a single-pair convenience wrapper. The candidate
-list is already a small pre-ranked in-memory set, so an in-memory index is
-preferred over a SQLite FTS round-trip: it avoids I/O and preserves the
-pre-rank ordering used for deterministic tie-breaking.
+`_tracks_match()` resolves each LLM `{artist, title}` selection against the
+candidate list using `rapidfuzz.fuzz.ratio` on `simplify_string()`-normalized
+titles, then on artist variants from `normalize_artist()`; anything below
+`FUZZ_THRESHOLD` (in `plex_client.py`) is rejected. The candidate list is a small
+pre-ranked in-memory set, so a linear scan is acceptable.
 
 ---
 
@@ -241,62 +271,56 @@ pre-rank ordering used for deterministic tie-breaking.
 |--------|---------|
 | `_connect()` | Connect via `PlexServer`, grab library section |
 | `is_connected()` | Check server + library are valid |
-| `get_library_stats()` | Genres/decades + counts (from TrackDB if synced, else Plex filter choices) |
-| `get_all_tracks()` | All tracks as `Track` models |
-| `get_tracks_by_filters()` | Filters + live exclusion (from TrackDB if synced, else Plex) |
-| `count_tracks_by_filters()` | Fast count (from TrackDB if synced, else Plex) |
-| `get_random_tracks()` | Random sample (from TrackDB if synced, else Plex sort) |
-| `search_tracks()` | Title/artist/album search (TrackDB FTS if synced, else Plex) |
+| `get_library_stats()` | Genres/decades + counts |
+| `get_all_tracks()` / `get_all_albums_metadata()` | Library as `Track` models |
+| `get_tracks_by_filters()` | Filters + live exclusion |
+| `count_tracks_by_filters()` | Fast count |
+| `get_random_tracks()` | Random sample |
+| `search_tracks()` | Title/artist/album search |
 | `get_track_by_key()` | Single track by ratingKey |
 | `get_thumb_path()` | Raw thumb path for art proxy |
-| `create_playlist()` | Create playlist, returns URL + counts |
-| `sync_track_db()` | Mirror the whole library into `TrackDB` page by page (ratings, plays, live flags) |
-| `ensure_synced()` | Sync only if the DB is empty or stale |
-| `_get_track_db()` | Return the populated TrackDB, or None to use the API |
+| `create_playlist()` / `update_playlist()` | Playlist write-back |
+| `get_clients()` / `get_playlists()` / `play_queue()` | Playback control |
 | `_convert_track()` | Plex object → `Track` model |
 
 ### `TrackCache`
 - In-memory, TTL 300s, max 50 entries
 - Key = MD5 of (genres, decades, exclude_live, min_rating)
-- Used by `generator.py` to avoid re-fetching on repeat generations
+- Used to avoid re-fetching on repeat generations
 
-### `TrackDB` (`track_db.py`)
-- File-backed SQLite mirror of the library (`backend/plexsage.db`); stdlib only.
-- **Serving reads:** `PlexClient` consults the DB first when it has rows, so
-  `get_library_stats`, `get_tracks_by_filters`, `count_tracks_by_filters`,
-  `get_random_tracks`, and `search_tracks` avoid Plex HTTP round-trips. Empty or
-  erroring DB → transparent fallback to the Plex API. `PlexClient.db_available()`
-  exposes the same gate so the generator can tell whether a read was served
-  locally and skip a redundant mirror (`sync_from_plex`) of rows already stored.
-- **Sync:** `PlexClient.sync_track_db()` walks the library one page
-  (`SYNC_PAGE_SIZE` = 500) at a time via `container_start`/`container_size`
-  (+`maxresults`, so plexapi returns a single page per request) and upserts each
-  page as it arrives; only the in-flight page is built in memory, not the whole
-  library. Removed tracks are pruned once the walk finishes. The app runs it on
-  startup and every `SYNC_INTERVAL_SECONDS` (30 min) via a background task in
-  the `main.py` lifespan; `POST /api/library/sync` triggers it on demand.
-- **Threading:** every thread (including each `asyncio.to_thread` worker) gets
-  its own connection from `_get_conn()`. With WAL, readers run concurrently and
-  never observe a writer's uncommitted batch. Writers go through `_write()`,
-  which holds a re-entrant lock (serializing writers) and rolls back on error.
-  `close()` closes every connection; later use reopens transparently.
-- **Tables:** `tracks` (incl. nullable `embedding` BLOB), `track_genres`,
-  `track_dimensions` (cached seed-track analysis: dimensions JSON + model +
-  metadata fingerprint), `tracks_fts` (FTS5 over title/artist/album), `meta`
-  (last sync time).
-- **Indexes:** `idx_tracks_nocase_sort` is a covering index whose leading
-  columns are the `COLLATE NOCASE` sort expressions of
-  `TrackDB.get_tracks_by_filters`, so the filtered listing is read in index
-  order (no temp b-tree) with no table lookups; it is created after
-  `_migrate()` because it includes `is_live`. A selective decade range still
-  filters via `idx_tracks_year` and sorts the few survivors.
-- **Migrations:** missing columns are added on startup (`_migrate`); the FTS
-  index is backfilled when empty.
+---
+
+## Local Library Cache (`library_cache.py`)
+
+- File-backed SQLite cache at `data/library_cache.db`; stdlib only.
+- **Connections:** each call opens its own connection (`get_db_connection()`) with
+  WAL + `busy_timeout`, so readers run concurrently with a writer.
+- **Tables:** `tracks` (rating_key, title, artist, album, duration_ms, year,
+  genres JSON, user_rating, is_live, parent_rating_key, view_count,
+  last_viewed_at), `sync_state` (single row: server id, last sync, count),
+  `results` (saved playlists/recommendations: snapshot JSON, title, subtitle,
+  art key), `track_dimensions` (seed-track analysis: dimensions JSON keyed by
+  rating_key + model + metadata fingerprint).
+- **Reads served locally:** `has_cached_tracks()`, `get_cached_tracks()`,
+  `get_tracks_by_filters()`, `count_tracks_by_filters()`,
+  `get_cached_genre_decade_stats()`, `get_album_candidates()`,
+  `get_album_familiarity()`, `get_metadata_batch()` (rating/recency for
+  pre-ranking). `get_tracks_by_filters` applies genre filtering in Python (the
+  `genres` column is JSON) and random-samples when a limit is set.
+- **Dimension cache:** `get_dimensions()` / `save_dimensions()` back
+  `analyzer.analyze_track()`; a model swap or edited metadata changes the
+  fingerprint and misses the cache.
+- **Sync:** `sync_library()` walks the library in `SYNC_BATCH_SIZE` (500) batches
+  with progress in `_sync_state`, exposed by `get_sync_state()` /
+  `get_sync_progress()`. `needs_resync()` and `is_cache_stale()` gate startup
+  syncs; `check_server_changed()` handles a swapped Plex server.
+- **Results:** `save_result()` / `get_result()` / `list_results()` /
+  `delete_result()` persist generated playlists and recommendations for the
+  history UI.
 
 ### Live Detection (`is_live_version`)
-- Checks `parentTitle` (album) and `title` for date patterns or keywords (live, concert, sbd, bootleg)
-- **Pre-computed once at sync time** and stored in `tracks.is_live`; DB queries filter with `WHERE is_live = 0` instead of post-filtering in Python.
-- The flag is surfaced as `Track.is_live` on DB reads and via `TrackDB.get_live_flags(rating_keys)`. The Plex API fallback (only used when the DB is empty) detects once per fetched track and stores it on the returned `Track`.
+- Checks the album (`parentTitle`) and title for date patterns or keywords (live, concert, sbd, bootleg).
+- **Pre-computed once at sync time** and stored in `tracks.is_live`; cache queries filter with `WHERE is_live = 0` instead of post-filtering in Python.
 
 ---
 
@@ -305,7 +329,7 @@ pre-rank ordering used for deterministic tie-breaking.
 ### Core Entities
 - **`Track`** — rating_key, title, artist, album, duration_ms, year, genres, is_live, art_url
 - **`Dimension`** — id, label, description (from seed track analysis)
-- **`FilterSet`** — genres, decades, track_count (15/25/40), exclude_live
+- **`FilterSet`** — genres, decades, track_count, exclude_live
 - **`Playlist`** — name, tracks, source_prompt, seed_track_key, selected_dimensions
 
 ### Config
@@ -316,12 +340,16 @@ pre-rank ordering used for deterministic tie-breaking.
 
 ### API Request/Response (grouped by endpoint)
 - Health: `HealthResponse`
+- Setup: `SetupStatusResponse`, `ValidatePlexResponse`, `ValidateAIResponse`, `SetupCompleteResponse`
 - Config: `ConfigResponse`, `UpdateConfigRequest`
-- Library: `LibraryStatsResponse`, `GenreCount`, `DecadeCount`
-- Analysis: `AnalyzePromptRequest/Response` (response includes `method` and `confidence`), `AnalyzeTrackRequest/Response`
-- Filter: `FilterPreviewRequest/Response`
+- Library: `LibraryStatsResponse`, `LibraryCacheStatusResponse`, `SyncProgress`, `SyncTriggerResponse`, `GenreCount`, `DecadeCount`
+- Analysis: `AnalyzePromptRequest/Response` (response includes `method` and `confidence`), `AnalyzeTrackRequest/Response` (includes `cached`)
+- Filter: `FilterPreviewRequest` (optional `prompt`), `FilterPreviewResponse`
 - Generate: `GenerateRequest`, `GenerateResponse`, `SeedTrackInput`
-- Playlist: `SavePlaylistRequest/Response`
+- Playlist: `SavePlaylistRequest/Response`, `UpdatePlaylistRequest/Response`
+- Plex: `PlexClientInfo`, `PlexPlaylistInfo`, `PlayQueueRequest/Response`
+- Recommend: `AlbumPreviewResponse`, `AnalyzePromptFiltersResponse`, `RecommendQuestionsResponse`, `RecommendSwitchModeResponse`
+- Results: `ResultListResponse`, `ResultDetail`
 - Ollama: `OllamaModel`, `OllamaModelInfo`, `OllamaModelsResponse`, `OllamaStatus`
 
 ---
@@ -334,19 +362,21 @@ pre-rank ordering used for deterministic tie-breaking.
 | Add a new LLM provider | `llm_client.py` | Add `_complete_<provider>()` + branch in `_complete()` |
 | Change cost estimates | `llm_client.py` | `MODEL_COSTS` dict |
 | Change context limits | `llm_client.py` | `MODEL_CONTEXT_LIMITS` dict |
-| Add a new filter type | `plex_client.py` | `_build_filters()` + `get_tracks_by_filters()` |
-| Change live detection | `plex_client.py` | `is_live_version()`, `LIVE_KEYWORDS`, `DATE_PATTERN` |
-| Change live filtering | `track_db.py` | `tracks.is_live`, `_build_where()`, `get_live_flags()` |
-| Change fuzzy matching | `generator.py` | `TrackMatcher`, `_fuzzy_track_match()`, `_trigrams()`, `FUZZ_THRESHOLD` in `plex_client.py` |
+| Add a new filter type | `plex_client.py` + `library_cache.py` | `_build_filters()` / `get_tracks_by_filters()` |
+| Change live detection | `plex_client.py` / `library_cache.py` | `is_live_version()`, `_is_live_version()` |
+| Change fuzzy matching | `generator.py` | `_tracks_match()`, `FUZZ_THRESHOLD` in `plex_client.py` |
 | Change the dynamic AI track budget | `generator.py` | `compute_track_budget()`, `_prompt_specificity()`, `BUDGET_FLOOR`, `MIN_TRACKS_PER_PICK` |
+| Change pre-ranking rules | `generator.py` | `pre_rank_tracks()` |
 | Change generation prompt | `generator.py` | `GENERATION_SYSTEM` |
 | Change analysis prompts | `analyzer.py` | `PROMPT_ANALYSIS_SYSTEM`, `TRACK_ANALYSIS_SYSTEM` |
-| Change prompt classification rules/descriptions | `prompt_classifier.py` | `MOOD_GENRE_MAP`, `DECADE_HINTS`, `GENRE_DESCRIPTIONS`, `CONFIDENCE_THRESHOLD` |
+| Change prompt classification rules/descriptions | `prompt_classifier.py` | hint dictionaries, `GENRE_DESCRIPTIONS`, `CONFIDENCE_THRESHOLD` |
 | Add a new config field | `models.py` + `config.py` | Add to `LLMConfig`/`PlexConfig` + load in `load_config()` |
 | Change SSE events | `generator.py` | `generate_playlist_stream()` |
 | Change caching behavior | `plex_client.py` | `TrackCache` class |
-| Change the library mirror / sync schedule | `track_db.py` + `plex_client.py` | `TrackDB` schema, `sync_track_db()`, `SYNC_INTERVAL_SECONDS` |
-| Change searchable fields | `track_db.py` | `tracks_fts` virtual table, `search_tracks()` |
+| Change the library sync / schedule | `library_cache.py` | `sync_library()`, `SYNC_BATCH_SIZE`, `needs_resync()` |
+| Change the seed-track dimension cache | `library_cache.py` + `analyzer.py` | `get_dimensions()` / `save_dimensions()` |
+| Change searchable fields | `library_cache.py` | `get_tracks_by_filters()`, `get_cached_tracks()` |
+| Change the recommendation pipeline | `recommender.py` | `RecommendationPipeline` |
 | Change config priority | `config.py` | `load_config()` |
 | Add a new Pydantic model | `models.py` | Add class, import in `main.py` |
 
@@ -355,15 +385,17 @@ pre-rank ordering used for deterministic tie-breaking.
 ## Dependencies (from imports)
 
 - `fastapi`, `starlette` — HTTP framework
-- `pydantic` — data models
+- `pydantic`, `pydantic-settings` — data models / settings
 - `httpx` — async HTTP (art proxy, Ollama)
 - `anthropic`, `openai`, `google-genai` — LLM SDKs
 - `plexapi` — Plex server API
 - `rapidfuzz` — fuzzy string matching
+- `json-repair` — tolerant LLM JSON parsing
 - `unidecode` — unicode normalization
+- `readability-lxml`, `lxml` — HTML cleanup for research scraping
 - `pyyaml`, `python-dotenv` — config loading
 - `requests` — (via plexapi)
-- `sqlite3`, `hashlib`, `difflib` — stdlib (local TrackDB + prompt classifier)
+- `sqlite3`, `hashlib`, `difflib` — stdlib (local library cache + prompt classifier)
 
 ---
 
@@ -375,7 +407,6 @@ pre-rank ordering used for deterministic tie-breaking.
 | `_plex_client` | `plex_client.py` | `PlexClient` |
 | `_llm_client` | `llm_client.py` | `LLMClient` |
 | `_track_cache` | `plex_client.py` | `TrackCache` |
-| `_track_db` | `track_db.py` | `TrackDB` |
+| `_sync_state`, `_schema_initialized` | `library_cache.py` | sync progress / schema flag |
 
 All initialized in `main.py` lifespan or via `init_*` functions.
-</contents>

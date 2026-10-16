@@ -10,6 +10,7 @@ import anthropic
 from google import genai
 from google.genai import types as genai_types
 import httpx
+from json_repair import repair_json
 import openai
 
 from backend.models import LLMConfig, OllamaModel, OllamaModelInfo, OllamaModelsResponse, OllamaStatus
@@ -17,17 +18,17 @@ from backend.models import LLMConfig, OllamaModel, OllamaModelInfo, OllamaModels
 logger = logging.getLogger(__name__)
 
 
-# Cost per million tokens (approximate, updated periodically)
+# Cost per million tokens (updated Feb 2026)
 MODEL_COSTS = {
     # Anthropic models (input/output per million tokens)
     "claude-sonnet-4-5": {"input": 3.00, "output": 15.00},
-    "claude-haiku-4-5": {"input": 0.25, "output": 1.25},
+    "claude-haiku-4-5": {"input": 1.00, "output": 5.00},
     # OpenAI models
     "gpt-4.1": {"input": 2.00, "output": 8.00},
     "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
     # Google Gemini models
     "gemini-2.5-pro": {"input": 1.25, "output": 5.00},
-    "gemini-2.5-flash": {"input": 0.075, "output": 0.30},
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
 }
 
 # Context limits per model (in tokens) - used to calculate max tracks
@@ -43,8 +44,11 @@ MODEL_CONTEXT_LIMITS = {
     "gemini-2.5-flash": 1_000_000,
 }
 
-# Tokens per track (approximate)
-TOKENS_PER_TRACK = 50
+# Tokens per track (based on real-world testing, Feb 2026)
+TOKENS_PER_TRACK = 40
+
+# Tokens per album for recommendation flow (artist, album, year, genres)
+TOKENS_PER_ALBUM = 25
 
 
 @dataclass
@@ -120,7 +124,7 @@ class LLMClient:
         logger.info("Calling Anthropic API with %d char prompt", len(prompt))
         response = self._client.messages.create(
             model=model,
-            max_tokens=4096,
+            max_tokens=8192,
             system=system,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -137,23 +141,26 @@ class LLMClient:
     def _complete_openai(
         self, prompt: str, system: str, model: str
     ) -> LLMResponse:
-        """Make a completion request to OpenAI."""
-        logger.info("Calling OpenAI API with %d char prompt", len(prompt))
+        """Make a completion request to OpenAI or custom OpenAI-compatible endpoint."""
+        logger.info("Calling OpenAI-compatible API with %d char prompt", len(prompt))
         response = self._client.chat.completions.create(
             model=model,
-            max_tokens=4096,
+            max_tokens=8192,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
         )
-        logger.debug("OpenAI response received")
+        logger.debug("OpenAI-compatible response received")
 
         content = response.choices[0].message.content
+        # Use getattr for safe token access (custom providers may omit usage)
+        input_tokens = getattr(response.usage, "prompt_tokens", 0) if response.usage else 0
+        output_tokens = getattr(response.usage, "completion_tokens", 0) if response.usage else 0
         return LLMResponse(
             content=content,
-            input_tokens=response.usage.prompt_tokens,
-            output_tokens=response.usage.completion_tokens,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             model=model,
         )
 
@@ -272,54 +279,16 @@ class LLMClient:
             model=model,
         )
 
-    def _complete_custom(
-        self, prompt: str, system: str, model: str
-    ) -> LLMResponse:
-        """Make a completion request to a custom OpenAI-compatible endpoint.
-
-        Args:
-            prompt: User prompt
-            system: System prompt
-            model: Model name
-
-        Returns:
-            LLMResponse with content and token counts
-        """
-        logger.info("Calling custom API with %d char prompt", len(prompt))
-        response = self._client.chat.completions.create(
-            model=model,
-            max_tokens=4096,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        logger.debug("Custom API response received")
-
-        content = response.choices[0].message.content
-        # Token counts may not be available from all custom providers
-        input_tokens = getattr(response.usage, "prompt_tokens", 0) if response.usage else 0
-        output_tokens = getattr(response.usage, "completion_tokens", 0) if response.usage else 0
-
-        return LLMResponse(
-            content=content,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            model=model,
-        )
-
     def _complete(self, prompt: str, system: str, model: str) -> LLMResponse:
         """Make a completion request to the configured provider."""
         if self.provider == "anthropic":
             return self._complete_anthropic(prompt, system, model)
-        elif self.provider == "openai":
+        elif self.provider in ("openai", "custom"):
             return self._complete_openai(prompt, system, model)
         elif self.provider == "gemini":
             return self._complete_gemini(prompt, system, model)
         elif self.provider == "ollama":
             return self._complete_ollama(prompt, system, model)
-        elif self.provider == "custom":
-            return self._complete_custom(prompt, system, model)
         else:
             raise ValueError(f"Unknown provider: {self.provider}")
 
@@ -354,6 +323,70 @@ class LLMClient:
             model = self.config.model_generation
         return self._complete(prompt, system, model)
 
+    def _extract_json_bounds(self, content: str) -> str | None:
+        """Extract JSON array or object from content with extra text.
+
+        Finds the first [ or { and its matching closing bracket,
+        properly handling nested structures and strings.
+
+        Args:
+            content: Raw content that may contain JSON with extra text
+
+        Returns:
+            Extracted JSON string, or None if no valid JSON found
+        """
+        # Find start of JSON
+        start_idx = -1
+        open_char = None
+        close_char = None
+
+        for i, c in enumerate(content):
+            if c == '[':
+                start_idx = i
+                open_char = '['
+                close_char = ']'
+                break
+            elif c == '{':
+                start_idx = i
+                open_char = '{'
+                close_char = '}'
+                break
+
+        if start_idx == -1:
+            return None
+
+        # Track bracket depth, handling strings
+        depth = 0
+        in_string = False
+        escape_next = False
+
+        for i in range(start_idx, len(content)):
+            c = content[i]
+
+            if escape_next:
+                escape_next = False
+                continue
+
+            if c == '\\' and in_string:
+                escape_next = True
+                continue
+
+            if c == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if in_string:
+                continue
+
+            if c == open_char:
+                depth += 1
+            elif c == close_char:
+                depth -= 1
+                if depth == 0:
+                    return content[start_idx:i + 1]
+
+        return None
+
     def parse_json_response(self, response: LLMResponse) -> Any:
         """Parse JSON from LLM response, handling common issues.
 
@@ -386,13 +419,37 @@ class LLMClient:
             if match:
                 content = match.group(1).strip()
 
+        # Replace curly/smart quotes with straight quotes (common LLM issue)
+        content = content.replace('"', '"').replace('"', '"')
+        content = content.replace(''', "'").replace(''', "'")
+
         try:
             return json.loads(content)
         except json.JSONDecodeError as e:
-            # Include first 200 chars of content for debugging
+            original_error = e
+
+            # Strategy 1: If "Extra data" error, try to extract just the JSON portion
+            if "Extra data" in str(e):
+                extracted = self._extract_json_bounds(content)
+                if extracted:
+                    try:
+                        return json.loads(extracted)
+                    except json.JSONDecodeError:
+                        pass  # Continue to next strategy
+
+            # Strategy 2: Use json-repair library to fix common LLM JSON issues
+            # (trailing commas, unescaped quotes, single quotes, etc.)
+            try:
+                repaired = repair_json(content, return_objects=True)
+                logger.debug("JSON repair succeeded for malformed LLM response")
+                return repaired
+            except Exception:
+                pass  # Fall through to error
+
+            # All strategies failed - report original error
             preview = content[:200] + "..." if len(content) > 200 else content
             raise ValueError(
-                f"Failed to parse LLM response as JSON: {e}\n"
+                f"Failed to parse LLM response as JSON: {original_error}\n"
                 f"Response preview: {preview}"
             )
 
@@ -434,6 +491,29 @@ def get_max_tracks_for_model(
 
     max_tracks = available_for_tracks // TOKENS_PER_TRACK
     return max(100, max_tracks)  # Minimum 100 tracks
+
+
+def get_max_albums_for_model(
+    model: str, buffer_percent: float = 0.10, config: LLMConfig | None = None
+) -> int:
+    """Calculate max albums that can be sent to a model.
+
+    Args:
+        model: Model name
+        buffer_percent: Buffer to leave (default 10%)
+        config: Optional LLMConfig for local provider context window lookup
+
+    Returns:
+        Maximum number of albums (minimum 100)
+    """
+    context_limit = get_model_context_limit(model, config)
+    usable_tokens = int(context_limit * (1 - buffer_percent))
+
+    # Reserve ~1000 tokens for system prompt and output
+    available_for_albums = usable_tokens - 1000
+
+    max_albums = available_for_albums // TOKENS_PER_ALBUM
+    return max(100, max_albums)
 
 
 def get_model_context_limit(model: str, config: LLMConfig | None = None) -> int:

@@ -347,7 +347,7 @@ class TestCustomProvider:
             assert client.provider == "custom"
 
     def test_complete_custom_success(self, mocker):
-        """Should make completion request to custom endpoint."""
+        """Should make completion request to custom endpoint via _complete_openai."""
         from backend.llm_client import LLMClient
         from backend.models import LLMConfig
 
@@ -371,7 +371,7 @@ class TestCustomProvider:
             mock_openai.OpenAI.return_value = mock_client
 
             client = LLMClient(config)
-            result = client._complete_custom("test prompt", "system prompt", "my-model")
+            result = client._complete_openai("test prompt", "system prompt", "my-model")
 
             assert result.content == '{"result": "test"}'
             assert result.input_tokens == 100
@@ -379,7 +379,7 @@ class TestCustomProvider:
             assert result.model == "my-model"
 
     def test_complete_dispatch_routes_to_custom(self, mocker):
-        """Should route 'custom' provider to _complete_custom method."""
+        """Should route 'custom' provider to _complete_openai method."""
         from backend.llm_client import LLMClient
         from backend.models import LLMConfig
 
@@ -394,13 +394,12 @@ class TestCustomProvider:
         with patch("backend.llm_client.openai"):
             client = LLMClient(config)
 
-        # Mock the _complete_custom method
-        mock_custom = mocker.patch.object(client, "_complete_custom")
-        mock_custom.return_value = MagicMock(content="test")
+        mock_openai_method = mocker.patch.object(client, "_complete_openai")
+        mock_openai_method.return_value = MagicMock(content="test")
 
         client._complete("test prompt", "system prompt", "my-model")
 
-        mock_custom.assert_called_once_with("test prompt", "system prompt", "my-model")
+        mock_openai_method.assert_called_once_with("test prompt", "system prompt", "my-model")
 
 
 class TestLocalProviderCosts:
@@ -597,3 +596,157 @@ class TestOllamaModelInfoParsing:
 
         assert result is not None
         assert result.context_window == 32768
+
+
+class TestJsonParsing:
+    """Tests for JSON parsing from LLM responses."""
+
+    def test_parse_json_with_extra_text(self):
+        """Should handle LLM responses with extra text after JSON array."""
+        from backend.llm_client import LLMClient, LLMResponse
+        from backend.models import LLMConfig
+
+        config = LLMConfig(
+            provider="anthropic",
+            api_key="test",
+            model_analysis="test",
+            model_generation="test",
+        )
+
+        with patch("backend.llm_client.anthropic"):
+            client = LLMClient(config)
+
+        # Simulate LLM adding explanation after JSON
+        response = LLMResponse(
+            content='[{"artist": "Test", "title": "Song"}]\n\nThis is a great selection because...',
+            input_tokens=100,
+            output_tokens=50,
+            model="test",
+        )
+
+        result = client.parse_json_response(response)
+        assert result == [{"artist": "Test", "title": "Song"}]
+
+    def test_parse_json_with_nested_objects(self):
+        """Should handle nested JSON objects with extra text."""
+        from backend.llm_client import LLMClient, LLMResponse
+        from backend.models import LLMConfig
+
+        config = LLMConfig(
+            provider="anthropic",
+            api_key="test",
+            model_analysis="test",
+            model_generation="test",
+        )
+
+        with patch("backend.llm_client.anthropic"):
+            client = LLMClient(config)
+
+        response = LLMResponse(
+            content='{"title": "Test", "tracks": [{"name": "Song"}]} Extra text here',
+            input_tokens=100,
+            output_tokens=50,
+            model="test",
+        )
+
+        result = client.parse_json_response(response)
+        assert result == {"title": "Test", "tracks": [{"name": "Song"}]}
+
+    def test_extract_json_bounds_with_strings_containing_brackets(self):
+        """Should handle JSON with brackets inside strings."""
+        from backend.llm_client import LLMClient
+        from backend.models import LLMConfig
+
+        config = LLMConfig(
+            provider="anthropic",
+            api_key="test",
+            model_analysis="test",
+            model_generation="test",
+        )
+
+        with patch("backend.llm_client.anthropic"):
+            client = LLMClient(config)
+
+        content = '[{"reason": "This track [live] is great"}] Some explanation'
+        result = client._extract_json_bounds(content)
+        assert result == '[{"reason": "This track [live] is great"}]'
+
+    def test_repair_unescaped_quotes_in_string(self):
+        """Should repair unescaped double quotes inside string values."""
+        from backend.llm_client import LLMClient, LLMResponse
+        from backend.models import LLMConfig
+
+        config = LLMConfig(
+            provider="anthropic",
+            api_key="test",
+            model_analysis="test",
+            model_generation="test",
+        )
+
+        with patch("backend.llm_client.anthropic"):
+            client = LLMClient(config)
+
+        # LLM put quotes around song name inside reason field
+        response = LLMResponse(
+            content='[{"artist": "Phoenix", "title": "Fences", "reason": "The song "Fences" is great"}]',
+            input_tokens=100,
+            output_tokens=50,
+            model="test",
+        )
+
+        result = client.parse_json_response(response)
+        assert result[0]["artist"] == "Phoenix"
+        assert result[0]["title"] == "Fences"
+        assert "Fences" in result[0]["reason"]
+
+    def test_repair_multiple_unescaped_quotes(self):
+        """Should repair multiple unescaped quotes in one string."""
+        from backend.llm_client import LLMClient, LLMResponse
+        from backend.models import LLMConfig
+
+        config = LLMConfig(
+            provider="anthropic",
+            api_key="test",
+            model_analysis="test",
+            model_generation="test",
+        )
+
+        with patch("backend.llm_client.anthropic"):
+            client = LLMClient(config)
+
+        response = LLMResponse(
+            content='[{"reason": "Both "Song A" and "Song B" are perfect"}]',
+            input_tokens=100,
+            output_tokens=50,
+            model="test",
+        )
+
+        result = client.parse_json_response(response)
+        assert "Song A" in result[0]["reason"]
+        assert "Song B" in result[0]["reason"]
+
+    def test_repair_json_with_newlines_in_strings(self):
+        """Should handle newlines inside string values."""
+        from backend.llm_client import LLMClient, LLMResponse
+        from backend.models import LLMConfig
+
+        config = LLMConfig(
+            provider="anthropic",
+            api_key="test",
+            model_analysis="test",
+            model_generation="test",
+        )
+
+        with patch("backend.llm_client.anthropic"):
+            client = LLMClient(config)
+
+        # Note: The actual newline character in the string
+        response = LLMResponse(
+            content='[{"reason": "Line one\nLine two"}]',
+            input_tokens=100,
+            output_tokens=50,
+            model="test",
+        )
+
+        result = client.parse_json_response(response)
+        assert "Line one" in result[0]["reason"]

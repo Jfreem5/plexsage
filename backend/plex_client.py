@@ -3,36 +3,19 @@
 import hashlib
 import logging
 import re
+import threading
 import time
-from datetime import datetime, timezone
-from typing import Any, Iterator
+from typing import Any
 
 from plexapi.exceptions import NotFound, Unauthorized
+from plexapi.playqueue import PlayQueue
 from plexapi.server import PlexServer
 from requests.exceptions import ConnectionError, Timeout
 from unidecode import unidecode
 
-from backend.models import Track
-from backend.track_db import SYNC_INTERVAL_SECONDS, get_track_db
+from backend.models import PlexClientInfo, PlexPlaylistInfo, Track
 
 logger = logging.getLogger(__name__)
-
-# Plex tracks requested (and written) per page while mirroring the library.
-# A full sync streams pages straight into the DB instead of materialising the
-# whole library in memory.
-SYNC_PAGE_SIZE = 500
-
-
-def _epoch_to_iso(timestamp: Any) -> str | None:
-    """Convert a Plex epoch timestamp (seconds) to an ISO-8601 UTC string."""
-    if not timestamp:
-        return None
-    try:
-        return datetime.fromtimestamp(int(timestamp), tz=timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-    except (TypeError, ValueError, OSError, OverflowError):
-        return None
 
 
 class TrackCache:
@@ -182,6 +165,9 @@ def is_live_version(track: Any) -> bool:
 class PlexClient:
     """Client for interacting with Plex server."""
 
+    # Cooldown between reconnection attempts (seconds)
+    RECONNECT_COOLDOWN = 30
+
     def __init__(self, url: str, token: str, music_library: str = "Music"):
         """Initialize Plex client.
 
@@ -196,6 +182,9 @@ class PlexClient:
         self._server: PlexServer | None = None
         self._library = None
         self._error: str | None = None
+        self._last_reconnect_attempt: float = time.time()
+        self._reconnect_lock = threading.Lock()
+        self._scratch_lock = threading.Lock()
         self._connect()
 
     def _connect(self) -> None:
@@ -229,7 +218,26 @@ class PlexClient:
             self._library = None
 
     def is_connected(self) -> bool:
-        """Check if connected to Plex server with valid library."""
+        """Check if connected to Plex server with valid library.
+
+        If not connected, attempts to reconnect (with cooldown to avoid hammering).
+        Thread-safe to prevent multiple simultaneous reconnection attempts.
+        """
+        if self._server is not None and self._library is not None:
+            return True
+
+        # Not connected - try to reconnect if cooldown has passed
+        now = time.time()
+        with self._reconnect_lock:
+            # Re-check connection inside lock (may have connected while waiting)
+            if self._server is not None and self._library is not None:
+                return True
+
+            if now - self._last_reconnect_attempt >= self.RECONNECT_COOLDOWN:
+                self._last_reconnect_attempt = now
+                logger.info("Attempting to reconnect to Plex server...")
+                self._connect()
+
         return self._server is not None and self._library is not None
 
     def get_machine_identifier(self) -> str | None:
@@ -242,135 +250,6 @@ class PlexClient:
         """Get the last error message if any."""
         return self._error
 
-    # ------------------------------------------------------------------
-    # Local track database
-    # ------------------------------------------------------------------
-
-    def _get_track_db(self):
-        """Return the global TrackDB if it has been populated, else None.
-
-        Used to decide whether a query can be served locally instead of over
-        the Plex HTTP API.
-        """
-        db = get_track_db()
-        if db is None:
-            return None
-        try:
-            if db.is_empty():
-                return None
-        except Exception:
-            logger.exception("TrackDB unavailable; falling back to Plex API")
-            return None
-        return db
-
-    def db_available(self) -> bool:
-        """Whether library queries are currently served from the local DB.
-
-        Mirrors the DB-first gate used by the query methods, so callers can
-        tell whether a recent read hit the local TrackDB or fell back to the
-        Plex API.
-        """
-        return self._get_track_db() is not None
-
-    def _iter_library_tracks(self, page_size: int) -> Iterator[list[Any]]:
-        """Yield the library one bounded page of Plex tracks at a time.
-
-        ``plexapi`` normally walks every page inside a single ``search`` call;
-        passing ``maxresults`` caps it to one page per request (see
-        ``PlexObject.fetchItems``), so peak memory stays proportional to
-        *page_size* instead of the size of the library.
-        """
-        start = 0
-        while True:
-            page = self._library.search(
-                libtype="track",
-                container_start=start,
-                container_size=page_size,
-                maxresults=page_size,
-            )
-            if not page:
-                return
-            yield page
-            if len(page) < page_size:
-                return
-            start += page_size
-
-    def sync_track_db(
-        self,
-        force: bool = False,
-        max_age_seconds: int = SYNC_INTERVAL_SECONDS,
-        page_size: int = SYNC_PAGE_SIZE,
-    ) -> int:
-        """Mirror the entire Plex music library into the local TrackDB.
-
-        Walks the library one page at a time (ratings, play counts,
-        last-played, live detection) and upserts each page as it arrives, so
-        peak memory tracks *page_size* rather than the size of the library.
-        Removed tracks are pruned once the walk completes so the DB stays a
-        faithful mirror.
-
-        Args:
-            force: Sync even if the DB is still fresh.
-            max_age_seconds: Freshness window before a sync is triggered.
-            page_size: Tracks fetched and written per page.
-
-        Returns:
-            Number of tracks synced, or 0 if skipped/unavailable. A fetch that
-            fails part-way leaves the pages already written in place but does
-            not mark the sync complete, so the next call retries it.
-        """
-        if page_size < 1:
-            raise ValueError("page_size must be at least 1")
-
-        db = get_track_db()
-        if db is None or not self.is_connected():
-            return 0
-
-        if not force and not db.needs_sync(max_age_seconds):
-            logger.debug("TrackDB is fresh; skipping sync")
-            return 0
-
-        count = 0
-        synced_keys: set[str] = set()
-        try:
-            for page in self._iter_library_tracks(page_size):
-                tracks: list[Track] = []
-                is_live_flags: list[bool] = []
-                ratings: list[int] = []
-                plays: list[int] = []
-                last_played: list[str | None] = []
-
-                for plex_track in page:
-                    tracks.append(self._convert_track(plex_track))
-                    is_live_flags.append(is_live_version(plex_track))
-                    ratings.append(int(getattr(plex_track, "userRating", 0) or 0))
-                    plays.append(int(getattr(plex_track, "viewCount", 0) or 0))
-                    last_played.append(_epoch_to_iso(getattr(plex_track, "lastViewedAt", None)))
-
-                count += db.upsert_tracks(
-                    tracks,
-                    is_live_flags=is_live_flags,
-                    user_ratings=ratings,
-                    play_counts=plays,
-                    last_played=last_played,
-                )
-                synced_keys.update(t.rating_key for t in tracks)
-        except Exception as exc:
-            logger.exception("Failed to fetch tracks for TrackDB sync: %s", exc)
-            return 0
-
-        db.prune_except(synced_keys)
-        db.set_last_sync()
-        logger.info("TrackDB sync complete: %d tracks", count)
-        return count
-
-    def ensure_synced(self, max_age_seconds: int = SYNC_INTERVAL_SECONDS) -> int:
-        """Sync the DB if it is empty or stale. Safe to call frequently."""
-        db = get_track_db()
-        if db is None or not db.needs_sync(max_age_seconds):
-            return 0
-        return self.sync_track_db(max_age_seconds=max_age_seconds)
-
     def get_music_libraries(self) -> list[str]:
         """Get list of music library names."""
         if not self._server:
@@ -382,22 +261,71 @@ class PlexClient:
         except Exception:
             return []
 
+    def get_library_total_tracks(self) -> int:
+        """Get total track count in the music library.
+
+        Returns:
+            Total number of tracks, or 0 if not connected
+        """
+        if not self._library:
+            return 0
+
+        try:
+            return self._library.totalViewSize(libtype="track")
+        except Exception as e:
+            logger.exception("Failed to get library track count: %s", e)
+            return 0
+
+    def get_all_raw_tracks(self) -> list[Any]:
+        """Get all raw track objects from the library.
+
+        This fetches all tracks in a single API call. For large libraries
+        (30k+ tracks), this may take 30-60 seconds.
+
+        Returns:
+            List of raw Plex track objects
+        """
+        if not self._library:
+            return []
+
+        try:
+            logger.info("Fetching all tracks from Plex (this may take a while)...")
+            return self._library.search(libtype="track")
+        except Exception as e:
+            logger.exception("Failed to get all tracks: %s", e)
+            return []
+
+    def get_all_albums_metadata(self) -> dict[str, dict[str, Any]]:
+        """Fetch all albums and return mapping of rating_key -> metadata.
+
+        Returns:
+            Dict mapping album rating_key (as string) to dict with 'genres' and 'year'
+        """
+        if not self._library:
+            return {}
+
+        try:
+            logger.info("Fetching all albums for metadata mapping...")
+            albums = self._library.search(libtype="album")
+            album_metadata = {
+                str(album.ratingKey): {
+                    "genres": [g.tag for g in album.genres],
+                    "year": getattr(album, "year", None),
+                }
+                for album in albums
+            }
+            logger.info("Got metadata for %d albums", len(album_metadata))
+            return album_metadata
+        except Exception as e:
+            logger.exception("Failed to get album metadata: %s", e)
+            return {}
+
     def get_library_stats(self) -> dict[str, Any]:
         """Get statistics about the music library.
-
-        Served from the local TrackDB when it has been synced (with genre and
-        decade counts), otherwise computed from the Plex API.
 
         Returns:
             Dict with total_tracks, genres, and decades
         """
-        db = self._get_track_db()
-        if db is not None:
-            try:
-                return db.get_library_stats()
-            except Exception:
-                logger.exception("TrackDB stats failed; falling back to Plex API")
-
         if not self._library:
             return {"total_tracks": 0, "genres": [], "decades": []}
 
@@ -454,6 +382,7 @@ class PlexClient:
         decades: list[str] | None = None,
         exclude_live: bool = True,
         min_rating: int = 0,
+        limit: int = 0,
     ) -> list[Track]:
         """Get tracks matching filter criteria.
 
@@ -462,77 +391,43 @@ class PlexClient:
             decades: List of decades (e.g., ["1990s", "2000s"])
             exclude_live: Whether to exclude live recordings
             min_rating: Minimum user rating (0-10, 0 = no filter)
+            limit: Max tracks to return (0 = no limit). When set, uses random
+                   server-side sampling for efficiency with large libraries.
 
         Returns:
             List of matching Track objects
         """
-        db = self._get_track_db()
-        if db is not None:
-            try:
-                return db.get_tracks_by_filters(
-                    genres=genres,
-                    decades=decades,
-                    exclude_live=exclude_live,
-                    min_rating=min_rating,
-                )
-            except Exception:
-                logger.exception("TrackDB filter query failed; falling back to Plex API")
-
         if not self._library:
             return []
 
         try:
             filters = self._build_filters(genres, decades, min_rating)
 
-            # Fetch tracks with server-side filters
-            plex_tracks = self._library.search(libtype="track", **filters)
+            # When limit is set, use server-side random sampling for efficiency
+            # Fetch extra to account for live version filtering
+            if limit > 0:
+                fetch_count = int(limit * 1.3) if exclude_live else limit
+                plex_tracks = self._library.search(
+                    libtype="track",
+                    sort="random",
+                    limit=fetch_count,
+                    **filters,
+                )
+            else:
+                plex_tracks = self._library.search(libtype="track", **filters)
 
-            # Live detection is computed exactly once per track here; the flag
-            # then travels with the Track instead of being recomputed later.
-            tracks: list[Track] = []
-            for plex_track in plex_tracks:
-                is_live = is_live_version(plex_track)
-                if exclude_live and is_live:
-                    continue
-                track = self._convert_track(plex_track)
-                track.is_live = is_live
-                tracks.append(track)
-            return tracks
+            # Post-filter for live versions (can't be done server-side)
+            if exclude_live:
+                plex_tracks = [t for t in plex_tracks if not is_live_version(t)]
+
+            # Apply limit after live filtering
+            if limit > 0:
+                plex_tracks = plex_tracks[:limit]
+
+            return [self._convert_track(t) for t in plex_tracks]
         except Exception as e:
             logger.exception("Failed to query Plex library with filters: %s", filters)
             raise PlexQueryError(f"Failed to query Plex library: {e}") from e
-
-    def get_filtered_track_count(
-        self,
-        genres: list[str] | None = None,
-        decades: list[str] | None = None,
-        min_rating: int = 0,
-    ) -> int:
-        """Get count of tracks matching filter criteria (without live filtering).
-
-        Args:
-            genres: List of genre names to include
-            decades: List of decades (e.g., ["1990s", "2000s"])
-            min_rating: Minimum user rating (0-10, 0 = no filter)
-
-        Returns:
-            Count of matching tracks, or -1 if unknown
-        """
-        if not self._library:
-            return 0
-
-        try:
-            filters = self._build_filters(genres, decades, min_rating)
-
-            # If no filters, return total track count (fast path)
-            if not filters:
-                return self._library.totalViewSize(libtype="track")
-
-            # Search and count results
-            results = self._library.search(libtype="track", **filters)
-            return len(results)
-        except Exception:
-            return -1
 
     def count_tracks_by_filters(
         self,
@@ -554,18 +449,6 @@ class PlexClient:
         Returns:
             Count of matching tracks, or -1 on error
         """
-        db = self._get_track_db()
-        if db is not None:
-            try:
-                return db.count_tracks_by_filters(
-                    genres=genres,
-                    decades=decades,
-                    exclude_live=exclude_live,
-                    min_rating=min_rating,
-                )
-            except Exception:
-                logger.exception("TrackDB count failed; falling back to Plex API")
-
         if not self._library:
             return -1
 
@@ -652,13 +535,6 @@ class PlexClient:
         Returns:
             List of random Track objects
         """
-        db = self._get_track_db()
-        if db is not None:
-            try:
-                return db.get_random_tracks(count=count, exclude_live=exclude_live)
-            except Exception:
-                logger.exception("TrackDB random query failed; falling back to Plex API")
-
         if not self._library:
             return []
 
@@ -672,16 +548,10 @@ class PlexClient:
                 limit=fetch_count,
             )
 
-            tracks: list[Track] = []
-            for plex_track in plex_tracks:
-                is_live = is_live_version(plex_track)
-                if exclude_live and is_live:
-                    continue
-                track = self._convert_track(plex_track)
-                track.is_live = is_live
-                tracks.append(track)
-                if len(tracks) >= count:
-                    break
+            if exclude_live:
+                plex_tracks = [t for t in plex_tracks if not is_live_version(t)]
+
+            tracks = [self._convert_track(t) for t in plex_tracks[:count]]
             return tracks
         except Exception as e:
             logger.exception("Failed to get random tracks: %s", e)
@@ -697,13 +567,6 @@ class PlexClient:
         Returns:
             List of matching Track objects
         """
-        db = self._get_track_db()
-        if db is not None:
-            try:
-                return db.search_tracks(query, limit=limit)
-            except Exception:
-                logger.exception("TrackDB search failed; falling back to Plex API")
-
         if not self._library:
             return []
 
@@ -751,6 +614,10 @@ class PlexClient:
     def get_thumb_path(self, rating_key: str) -> str | None:
         """Get the raw Plex thumb path for a track.
 
+        Walks the Plex hierarchy: track thumb → album thumb → artist thumb.
+        Compilation/soundtrack albums often lack track and album art, so
+        falling back to the artist thumb avoids blank covers.
+
         Args:
             rating_key: Plex rating key
 
@@ -762,16 +629,23 @@ class PlexClient:
 
         try:
             item = self._server.fetchItem(int(rating_key))
-            return item.thumb if hasattr(item, "thumb") else None
+            return (
+                getattr(item, "thumb", None)
+                or getattr(item, "parentThumb", None)
+                or getattr(item, "grandparentThumb", None)
+            )
         except Exception:
             return None
 
-    def create_playlist(self, name: str, rating_keys: list[str]) -> dict[str, Any]:
+    def create_playlist(
+        self, name: str, rating_keys: list[str], description: str = ""
+    ) -> dict[str, Any]:
         """Create a playlist in Plex.
 
         Args:
             name: Playlist name
             rating_keys: List of track rating keys
+            description: Playlist description/summary (optional)
 
         Returns:
             Dict with success status and playlist_id or error
@@ -805,14 +679,15 @@ class PlexClient:
             # Create playlist
             playlist = self._server.createPlaylist(name, items=items)
 
-            # Build the Plex web app URL for the playlist (uses local server URL)
-            playlist_url = None
-            machine_id = self.get_machine_identifier()
-            if machine_id:
-                playlist_url = (
-                    f"{self.url}/web/index.html#!/server/{machine_id}"
-                    f"/playlist?key=%2Fplaylists%2F{playlist.ratingKey}"
-                )
+            # Set description/summary if provided
+            if description:
+                try:
+                    playlist.edit(summary=description)
+                    logger.info("Set playlist description: %d chars", len(description))
+                except Exception as e:
+                    logger.warning("Failed to set playlist description: %s", e)
+
+            playlist_url = self._build_playlist_url(playlist.ratingKey)
 
             return {
                 "success": True,
@@ -823,6 +698,420 @@ class PlexClient:
             }
         except Exception as e:
             logger.exception("Failed to create playlist '%s'", name)
+            return {"success": False, "error": str(e)}
+
+    _MOBILE_KEYWORDS = {"ios", "android", "iphone", "ipad", "ipod", "tvos"}
+
+    @classmethod
+    def _is_mobile_client(cls, product: str, platform: str) -> bool:
+        """Check if a client is a mobile/TV device that needs an active session."""
+        tokens = set(re.split(r"[\s,/]+", f"{product} {platform}".lower()))
+        return bool(tokens & cls._MOBILE_KEYWORDS)
+
+    def get_clients(self) -> list[PlexClientInfo]:
+        """Get online Plex clients capable of playback.
+
+        Discovers clients via two methods:
+        1. server.clients() — local GDM-discovered clients
+        2. myPlexAccount().resources() — cloud-connected players (Plexamp, etc.)
+
+        Returns:
+            List of PlexClientInfo for clients with playback capability.
+            Unresponsive clients are silently excluded.
+        """
+        if not self._server:
+            return []
+
+        result = []
+        seen_ids: set[str] = set()
+
+        # Method 1: Local GDM discovery
+        try:
+            local_clients = self._server.clients()
+        except Exception as e:
+            logger.warning("Failed to get local Plex clients: %s", e)
+            local_clients = []
+
+        for client in local_clients:
+            capabilities = getattr(client, "protocolCapabilities", None) or []
+            if isinstance(capabilities, str):
+                capabilities = [c.strip() for c in capabilities.split(",")]
+            if "playback" not in capabilities:
+                continue
+
+            try:
+                is_playing = client.isPlayingMedia(includePaused=True)
+            except Exception:
+                logger.warning("Client '%s' unresponsive, skipping", getattr(client, "title", "unknown"))
+                continue
+
+            mid = client.machineIdentifier
+            seen_ids.add(mid)
+            result.append(PlexClientInfo(
+                client_id=mid,
+                name=client.title,
+                product=client.product,
+                platform=client.platform,
+                is_playing=is_playing,
+                is_mobile=self._is_mobile_client(client.product, client.platform),
+            ))
+
+        local_count = len(result)
+
+        # Method 2: Cloud-connected players via account resources
+        try:
+            account = self._server.myPlexAccount()
+            resources = account.resources()
+
+            # Pre-fetch sessions once for all cloud resources
+            playing_ids: set[str] = set()
+            try:
+                for session in self._server.sessions():
+                    if session.player:
+                        playing_ids.add(session.player.machineIdentifier)
+            except Exception:
+                pass
+
+            for resource in resources:
+                provides = getattr(resource, "provides", "") or ""
+                if "player" not in provides:
+                    continue
+                # Skip if already found via local discovery
+                client_id = resource.clientIdentifier
+                if client_id in seen_ids:
+                    continue
+                # Only include online resources
+                if not getattr(resource, "presence", False):
+                    continue
+
+                seen_ids.add(client_id)
+                product = getattr(resource, "product", "Unknown")
+                platform = getattr(resource, "platform", "Unknown") or getattr(resource, "platformVersion", "Unknown")
+                result.append(PlexClientInfo(
+                    client_id=client_id,
+                    name=resource.name,
+                    product=product,
+                    platform=platform,
+                    is_playing=client_id in playing_ids,
+                    is_mobile=self._is_mobile_client(product, platform),
+                ))
+        except Exception as e:
+            logger.warning("Failed to query account resources for players: %s", e)
+
+        logger.debug("Client discovery: %d found (%d local, %d cloud)", len(result), local_count, len(result) - local_count)
+        return result
+
+    def get_playlists(self) -> list[PlexPlaylistInfo]:
+        """Get audio playlists from the Plex server.
+
+        Returns:
+            List of PlexPlaylistInfo sorted alphabetically by title.
+        """
+        if not self._server:
+            return []
+
+        try:
+            playlists = self._server.playlists(playlistType="audio")
+            result = [
+                PlexPlaylistInfo(
+                    rating_key=str(playlist.ratingKey),
+                    title=playlist.title,
+                    track_count=playlist.leafCount,
+                )
+                for playlist in playlists
+                if not playlist.smart and not playlist.radio
+            ]
+            return sorted(result, key=lambda p: p.title.lower())
+        except Exception as e:
+            logger.exception("Failed to get playlists: %s", e)
+            return []
+
+    def update_playlist(
+        self,
+        playlist_id: str,
+        rating_keys: list[str],
+        mode: str = "replace",
+        description: str = "",
+    ) -> dict[str, Any]:
+        """Update an existing Plex playlist by replacing or appending tracks.
+
+        Handles the __scratch__ sentinel for auto-creating "MediaSage - Now Playing".
+
+        Args:
+            playlist_id: Rating key of target playlist, or "__scratch__" sentinel
+            rating_keys: List of track rating keys to add
+            mode: 'replace' or 'append'
+            description: Optional playlist description/summary
+
+        Returns:
+            Dict with success, tracks_added, tracks_skipped, duplicates_skipped,
+            playlist_url, error
+        """
+        if not self._server:
+            return {"success": False, "error": "Not connected to Plex"}
+
+        try:
+            # Handle __scratch__ sentinel — find or create "MediaSage - Now Playing"
+            if playlist_id == "__scratch__":
+                with self._scratch_lock:
+                    scratch_playlist = None
+                    try:
+                        for p in self._server.playlists(playlistType="audio"):
+                            if p.title == "MediaSage - Now Playing":
+                                scratch_playlist = p
+                                break
+                    except Exception as e:
+                        logger.warning("Failed to search for scratch playlist: %s", e)
+
+                    if scratch_playlist is None:
+                        # Create new scratch playlist with the provided tracks
+                        items = []
+                        tracks_skipped = 0
+                        for key in rating_keys:
+                            try:
+                                items.append(self._server.fetchItem(int(key)))
+                            except Exception:
+                                tracks_skipped += 1
+
+                        if not items:
+                            return {"success": False, "error": "No valid tracks found"}
+
+                        playlist = self._server.createPlaylist(
+                            "MediaSage - Now Playing", items=items
+                        )
+
+                        if description:
+                            try:
+                                playlist.edit(summary=description)
+                            except Exception as e:
+                                logger.warning("Failed to set playlist description: %s", e)
+
+                        playlist_url = self._build_playlist_url(playlist.ratingKey)
+                        return {
+                            "success": True,
+                            "tracks_added": len(items),
+                            "tracks_skipped": tracks_skipped,
+                            "duplicates_skipped": 0,
+                            "playlist_url": playlist_url,
+                        }
+                    else:
+                        # Use the existing scratch playlist
+                        playlist_id = str(scratch_playlist.ratingKey)
+
+            # Fetch the target playlist
+            playlist = self._server.fetchItem(int(playlist_id))
+
+            # Fetch new track objects
+            items = []
+            tracks_skipped = 0
+            duplicates_skipped = 0
+
+            if mode == "replace":
+                # Fetch new items FIRST to avoid data loss if add fails
+                for key in rating_keys:
+                    try:
+                        items.append(self._server.fetchItem(int(key)))
+                    except Exception:
+                        tracks_skipped += 1
+
+                if not items:
+                    return {
+                        "success": False,
+                        "error": "No valid tracks found to replace with",
+                        "tracks_added": 0,
+                        "tracks_skipped": tracks_skipped,
+                        "duplicates_skipped": 0,
+                    }
+
+                # Add new items FIRST, then remove old ones.
+                # This avoids data loss: if addItems fails, old tracks remain.
+                # If removeItems fails, user has duplicates (recoverable) not emptiness.
+                existing_items = playlist.items()
+                playlist.addItems(items)
+                warning = None
+                if existing_items:
+                    try:
+                        playlist.removeItems(existing_items)
+                    except Exception as e:
+                        logger.warning("Failed to remove old items during replace: %s", e)
+                        warning = "Replaced tracks were added but old tracks could not be removed. Playlist may contain duplicates."
+
+            elif mode == "append":
+                warning = None
+                # Build set of existing rating keys for deduplication
+                existing_keys = {
+                    str(item.ratingKey) for item in playlist.items()
+                }
+
+                for key in rating_keys:
+                    if key in existing_keys:
+                        duplicates_skipped += 1
+                        continue
+                    try:
+                        items.append(self._server.fetchItem(int(key)))
+                    except Exception:
+                        tracks_skipped += 1
+
+                if items:
+                    playlist.addItems(items)
+
+            else:
+                return {"success": False, "error": f"Unknown update mode: {mode}"}
+
+            # Update description if provided
+            if description:
+                try:
+                    playlist.edit(summary=description)
+                except Exception as e:
+                    logger.warning("Failed to set playlist description: %s", e)
+
+            playlist_url = self._build_playlist_url(playlist.ratingKey)
+            result = {
+                "success": True,
+                "tracks_added": len(items),
+                "tracks_skipped": tracks_skipped,
+                "duplicates_skipped": duplicates_skipped,
+                "playlist_url": playlist_url,
+            }
+            if warning:
+                result["warning"] = warning
+            return result
+        except Exception as e:
+            logger.exception("Failed to update playlist '%s'", playlist_id)
+            return {"success": False, "error": str(e)}
+
+    def _build_playlist_url(self, rating_key: int) -> str | None:
+        """Build the Plex web app URL for a playlist."""
+        machine_id = self.get_machine_identifier()
+        if not machine_id:
+            return None
+        return (
+            f"{self.url}/web/index.html#!/server/{machine_id}"
+            f"/playlist?key=%2Fplaylists%2F{rating_key}"
+        )
+
+    def play_queue(
+        self, rating_keys: list[str], client_id: str, mode: str = "replace"
+    ) -> dict[str, Any]:
+        """Create a play queue and start playback on a Plex client.
+
+        Args:
+            rating_keys: List of track rating keys
+            client_id: machineIdentifier of target client
+            mode: 'replace' (new queue) or 'play_next' (add after current)
+
+        Returns:
+            Dict with success, client_name, client_product, tracks_queued, error
+        """
+        if not self._server:
+            return {"success": False, "error": "Not connected to Plex"}
+
+        # Find the target client — try local GDM first, then cloud resources
+        target_client = None
+        try:
+            for c in self._server.clients():
+                if c.machineIdentifier == client_id:
+                    target_client = c
+                    break
+        except Exception:
+            pass
+
+        # Fall back to cloud-connected resource
+        if not target_client:
+            try:
+                account = self._server.myPlexAccount()
+                for resource in account.resources():
+                    if resource.clientIdentifier == client_id:
+                        target_client = resource.connect()
+                        break
+            except Exception as e:
+                logger.warning("Failed to connect to cloud client %s: %s", client_id, e)
+
+        if not target_client:
+            return {
+                "success": False,
+                "error": "Device couldn't be reached. Try starting playback on the device first, then re-open the picker.",
+                "error_code": "not_found",
+            }
+
+        # Proxy through server for reliable communication
+        try:
+            target_client.proxyThroughServer(value=True)
+        except Exception:
+            pass  # Best effort — some clients don't support this
+
+        # Fetch track objects
+        tracks = []
+        tracks_skipped = 0
+        for key in rating_keys:
+            try:
+                item = self._server.fetchItem(int(key))
+                tracks.append(item)
+            except Exception as e:
+                tracks_skipped += 1
+                logger.warning("Failed to fetch track %s for play queue: %s", key, e)
+
+        if not tracks:
+            return {"success": False, "error": "No valid tracks found"}
+
+        try:
+            if mode == "replace":
+                play_queue = PlayQueue.create(
+                    self._server,
+                    items=tracks,
+                    startItem=tracks[0],
+                    includeRelated=0,
+                )
+                target_client.playMedia(play_queue)
+            elif mode == "play_next":
+                # Get current play queue from client timeline entries
+                # timelines() returns a list; timeline is a single object/None
+                play_queue_id = None
+                try:
+                    for entry in target_client.timelines():
+                        if entry.type == "music" and getattr(entry, "playQueueID", None):
+                            play_queue_id = entry.playQueueID
+                            break
+                except Exception as e:
+                    logger.warning("Failed to get timelines from client %s: %s", client_id, e)
+                    return {"success": False, "error": "Could not read active queue from client"}
+                if not play_queue_id:
+                    return {
+                        "success": False,
+                        "error": "No active play queue on this client",
+                    }
+                existing_queue = PlayQueue.get(
+                    self._server, play_queue_id, own=True
+                )
+                # Add in reverse order so tracks play in intended order
+                tracks_queued = 0
+                reversed_tracks = list(reversed(tracks))
+                for i, track in enumerate(reversed_tracks):
+                    try:
+                        is_last = i == len(reversed_tracks) - 1
+                        existing_queue.addItem(track, playNext=True, refresh=is_last)
+                        tracks_queued += 1
+                    except Exception:
+                        logger.warning("Failed to add track %s to queue", track.ratingKey)
+
+            else:
+                return {"success": False, "error": f"Unknown play queue mode: {mode}"}
+
+            actual_queued = tracks_queued if mode == "play_next" else len(tracks)
+            return {
+                "success": True,
+                "client_name": target_client.title,
+                "client_product": target_client.product,
+                "tracks_queued": actual_queued,
+                "tracks_skipped": tracks_skipped,
+            }
+        except ConnectionError:
+            return {
+                "success": False,
+                "error": f"Client '{target_client.title}' went offline during playback",
+            }
+        except Exception as e:
+            logger.exception("Failed to create play queue on '%s'", target_client.title)
             return {"success": False, "error": str(e)}
 
     def _convert_track(self, plex_track: Any) -> Track:

@@ -1,26 +1,28 @@
-# PlexSage
+# MediaSage for Plex
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Docker](https://img.shields.io/badge/docker-ghcr.io%2Fecwilsonaz%2Fplexsage-blue)](https://ghcr.io/ecwilsonaz/plexsage)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Docker Hub](https://img.shields.io/badge/docker-ecwilson%2Fmediasage-blue)](https://hub.docker.com/r/ecwilson/mediasage)
+[![GHCR](https://img.shields.io/badge/ghcr-ecwilsonaz%2Fmediasage-blue)](https://ghcr.io/ecwilsonaz/mediasage)
+[![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
 
-**AI-powered playlist generation for Plex—using only tracks you actually own.**
+**AI-powered playlists and album recommendations for Plex—using only music you actually own.**
 
-PlexSage is a self-hosted web app that creates music playlists by combining LLM intelligence with your Plex library. Every track it suggests is guaranteed playable because it only considers music you have.
+MediaSage is a self-hosted web app that creates playlists and recommends albums by combining LLM intelligence with your Plex library. Every suggestion is guaranteed playable because it only considers music you have.
 
-![PlexSage Screenshot](docs/images/screenshot-results.png)
+*Sample Generated Playlist:*
+![MediaSage Screenshot](docs/images/screenshot-playlist.png)
 
-## Demo
+*Sample Generated Album Recommendation:*
+![MediaSage Screenshot](docs/images/screenshot-album.png)
 
-### Prompt-Based Flow
-Describe what you want in natural language, refine filters, and generate a playlist:
+*Home Screen:*
+![MediaSage Screenshot](docs/images/screenshot-home.png)
 
-![Prompt-based flow demo](https://github.com/user-attachments/assets/ae605d5a-676b-49ea-ae3a-3da79b01a97f)
+*Playlist Flow:*
+![MediaSage Screenshot](docs/images/screenshot-playlist-start.png)
 
-### Seed-Based Flow
-Start from a song you love and explore its musical dimensions:
-
-![Seed-based flow demo](https://github.com/user-attachments/assets/0812a847-7d4a-4bf6-8d45-581a137fd71f)
+*Album Flow:*
+![MediaSage Screenshot](docs/images/screenshot-album-start.png)
 
 ---
 
@@ -28,25 +30,24 @@ Start from a song you love and explore its musical dimensions:
 
 ```bash
 docker run -d \
-  --name plexsage \
-  -p 8765:8765 \
-  -e PLEX_URL=http://your-plex-server:32400 \
-  -e PLEX_TOKEN=your-plex-token \
-  -e GEMINI_API_KEY=your-gemini-key \
+  --name mediasage \
+  -p 5765:5765 \
+  -v mediasage-data:/app/data \
   --restart unless-stopped \
-  ghcr.io/ecwilsonaz/plexsage:latest
+  ghcr.io/ecwilsonaz/mediasage:latest
 ```
 
-Open **http://localhost:8765** and start creating playlists.
+Open **http://localhost:5765** — a setup wizard walks you through connecting Plex, choosing an AI provider, and syncing your library.
 
-**Requirements:** Docker, a Plex server with music, a [Plex token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/), and an API key from Google, Anthropic, or OpenAI.
+You can also pass credentials as environment variables to skip the wizard. See [Configuration](#configuration) for details.
+
+**Requirements:** Docker, a Plex server with music, a [Plex token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/), and an API key from Google, Anthropic, or OpenAI (or a local model via Ollama).
 
 ---
 
 ## Contents
 
-- [Demo](#demo)
-- [Why PlexSage?](#why-plexsage)
+- [Why MediaSage?](#why-mediasage)
 - [Features](#features)
 - [Installation](#installation)
 - [Configuration](#configuration)
@@ -56,7 +57,7 @@ Open **http://localhost:8765** and start creating playlists.
 
 ---
 
-## Why PlexSage?
+## Why MediaSage?
 
 **Plex users with personal music libraries have few good options for AI playlists.**
 
@@ -64,9 +65,9 @@ Plexamp's built-in Sonic Sage used ChatGPT to generate playlists, but it was des
 
 When [Tidal integration ended in October 2024](https://forums.plex.tv/t/tidal-integration-with-plex-ending-october-28-2024/885728), Sonic Sage lost its foundation. Generic tools like ChatGPT have the same problem: they recommend from an infinite catalog with no awareness of what you actually own.
 
-**PlexSage inverts the approach:**
+**MediaSage inverts the approach:**
 
-| Filter-Last (Sonic Sage, ChatGPT) | Filter-First (PlexSage) |
+| Filter-Last (Sonic Sage, ChatGPT) | Filter-First (MediaSage) |
 |-----------------------------------|-------------------------|
 | AI recommends from infinite catalog | AI only sees your library |
 | Hide missing tracks after | No missing tracks possible |
@@ -78,14 +79,26 @@ The result: every track in every playlist exists in your Plex library and plays 
 
 ## Features
 
-### Two Ways to Start
+### Playlist Generation
+
+Create playlists two ways:
 
 **Describe what you want** — Natural language prompts like:
 - "Melancholy 90s alternative for a rainy day"
 - "Upbeat instrumental jazz for a dinner party"
 - "Late night electronic, nothing too aggressive"
 
-**Start from a song** — Pick a track you love, then explore musical dimensions: mood, era, instrumentation, genre, production style. Select which qualities you want more of. Dimensions are cached locally, so re-analyzing a track (same model) is instant and free.
+**Start from a song** — Pick a track you love, then explore musical dimensions: mood, era, instrumentation, genre, production style. Select which qualities you want more of.
+
+### Album Recommendations
+
+Describe a mood or moment, answer two quick questions about your preferences, and get a single perfect album to listen to—with an editorial pitch explaining why it fits.
+
+- **Library mode** — recommends albums you own, ready for instant playback
+- **Discovery mode** — suggests albums you don't own yet, based on your taste profile
+- **Familiarity control** — choose between comfort picks, hidden gems, or rediscoveries
+- **Show Me Another** — regenerate without starting over
+- Primary recommendation with a full write-up, plus two secondary picks
 
 ### Smart Filtering
 
@@ -97,41 +110,43 @@ Before the AI sees anything, you control the pool:
 
 Real-time track counts show exactly how your filters narrow results.
 
-### Cost Control
+### Local Library Cache
 
-Choose how many tracks to send to the AI:
+MediaSage syncs your Plex library to a local SQLite database. After a one-time sync (~2 min for 18,000 tracks), all library operations—filtering, counting, sending to AI—happen locally in milliseconds instead of waiting on Plex.
 
-| Track Count | Use Case | Typical Cost |
-|-------------|----------|--------------|
-| 100–500 | Focused playlists, quick generation | Pennies |
-| 1,000–5,000 | Broad requests, more variety | Cents |
-| Up to 18,000 | Full library exploration (Gemini only) | Under $0.50 |
-
-Estimated cost displays before you generate. No surprises.
+- **Setup wizard** walks you through first-run configuration and sync
+- **Footer status** shows track count and last sync time
+- **Auto-refresh** keeps cache current (syncs if >24h stale)
+- **Manual refresh** available anytime
 
 ### Multi-Provider Support
 
 Bring your own API key—or run locally:
 
-| Provider | Max Tracks | Best For |
-|----------|------------|----------|
-| **Google Gemini** | ~18,000 | Large libraries, lowest cost |
-| **Anthropic Claude** | ~3,500 | Nuanced recommendations |
-| **OpenAI GPT** | ~2,300 | Solid all-around |
-| **Ollama** ⚗️ | Varies by model | Privacy, no API costs |
-| **Custom** ⚗️ | Configurable | Self-hosted, OpenAI-compatible APIs |
+| Provider | Max Tracks | Typical Cost | Best For |
+|----------|------------|--------------|----------|
+| **Google Gemini** | ~18,000 | $0.03 – $0.25 | Large libraries, lowest cost |
+| **Anthropic Claude** | ~3,500 | $0.15 – $0.25 | Nuanced recommendations |
+| **OpenAI GPT** | ~2,300 | $0.05 – $0.10 | Solid all-around |
+| **Ollama** ⚗️ | Varies | Free | Privacy, local inference |
+| **Custom** ⚗️ | Configurable | Free | Self-hosted, OpenAI-compatible APIs |
 
-⚗️ *Local LLM support is experimental. [Report issues](https://github.com/ecwilsonaz/plexsage/issues).*
+⚗️ *Local LLM support is experimental. [Report issues](https://github.com/ecwilsonaz/mediasage/issues).*
 
-PlexSage auto-detects your provider based on which key you configure.
+> **Free option:** Google Gemini offers a free API tier that's more than enough for personal use — no credit card required. See the [Gemini free credit guide](docs/gemini-free-credit-guide.md) for setup instructions and details.
 
-### Review and Save
+Estimated cost displays before you generate. MediaSage auto-detects your provider based on which key you configure.
 
+### Play and Save
+
+- **Play Now** — send tracks directly to any Plex device for instant playback
+- **Create** a new playlist, **replace** an existing one, or **append** tracks to one
+- Device picker shows all active Plex clients with status indicators
+- Duplicate detection when appending to existing playlists
 - Preview tracks with album art before saving
 - Remove tracks you don't want
 - Rename the playlist
 - See actual token usage and cost
-- One-click save to Plex
 
 ---
 
@@ -140,9 +155,9 @@ PlexSage auto-detects your provider based on which key you configure.
 ### Docker Compose (Recommended)
 
 ```bash
-mkdir plexsage && cd plexsage
-curl -O https://raw.githubusercontent.com/ecwilsonaz/plexsage/main/docker-compose.yml
-curl -O https://raw.githubusercontent.com/ecwilsonaz/plexsage/main/.env.example
+mkdir mediasage && cd mediasage
+curl -O https://raw.githubusercontent.com/ecwilsonaz/mediasage/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/ecwilsonaz/mediasage/main/.env.example
 mv .env.example .env
 ```
 
@@ -170,20 +185,22 @@ docker compose up -d
 <summary><strong>Synology (Container Manager)</strong></summary>
 
 **GUI:**
-1. **Container Manager** → **Registry** → Search `ghcr.io/ecwilsonaz/plexsage`
+1. **Container Manager** → **Registry** → Search `ghcr.io/ecwilsonaz/mediasage`
 2. Download `latest` tag
 3. **Container** → **Create**
-4. Port: 8765 → 8765
+4. Port: 5765 → 5765
 5. Add environment variables: `PLEX_URL`, `PLEX_TOKEN`, `GEMINI_API_KEY`
 
 **Docker Compose:**
 ```bash
-mkdir -p /volume1/docker/plexsage && cd /volume1/docker/plexsage
-curl -O https://raw.githubusercontent.com/ecwilsonaz/plexsage/main/docker-compose.yml
-curl -O https://raw.githubusercontent.com/ecwilsonaz/plexsage/main/.env.example
+mkdir -p /volume1/docker/mediasage && cd /volume1/docker/mediasage
+curl -O https://raw.githubusercontent.com/ecwilsonaz/mediasage/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/ecwilsonaz/mediasage/main/.env.example
 mv .env.example .env && nano .env
 ```
-Then in **Container Manager** → **Project** → **Create**, point to `/volume1/docker/plexsage`.
+Then in **Container Manager** → **Project** → **Create**, point to `/volume1/docker/mediasage`.
+
+**No Docker?** Some Synology models (especially ARM-based units) don't support Docker/Container Manager. See [Bare Metal](#bare-metal-no-docker) below for running MediaSage directly with Python.
 
 </details>
 
@@ -191,8 +208,8 @@ Then in **Container Manager** → **Project** → **Create**, point to `/volume1
 <summary><strong>Unraid</strong></summary>
 
 1. **Docker** → **Add Container**
-2. Repository: `ghcr.io/ecwilsonaz/plexsage:latest`
-3. Port: 8765 → 8765
+2. Repository: `ghcr.io/ecwilsonaz/mediasage:latest`
+3. Port: 5765 → 5765
 4. Add variables: `PLEX_URL`, `PLEX_TOKEN`, `GEMINI_API_KEY`
 
 </details>
@@ -201,8 +218,8 @@ Then in **Container Manager** → **Project** → **Create**, point to `/volume1
 <summary><strong>TrueNAS SCALE</strong></summary>
 
 1. **Apps** → **Discover Apps** → **Custom App**
-2. Image: `ghcr.io/ecwilsonaz/plexsage`, Tag: `latest`
-3. Port: 8765
+2. Image: `ghcr.io/ecwilsonaz/mediasage`, Tag: `latest`
+3. Port: 5765
 4. Add environment variables
 
 </details>
@@ -214,15 +231,75 @@ Then in **Container Manager** → **Project** → **Create**, point to `/volume1
 
 ```yaml
 services:
-  plexsage:
-    image: ghcr.io/ecwilsonaz/plexsage:latest
+  mediasage:
+    image: ghcr.io/ecwilsonaz/mediasage:latest
     ports:
-      - "8765:8765"
+      - "5765:5765"
     environment:
       - PLEX_URL=http://your-server:32400
       - PLEX_TOKEN=your-token
       - GEMINI_API_KEY=your-key
+    volumes:
+      - ./data:/app/data
     restart: unless-stopped
+```
+
+</details>
+
+### Bare Metal (No Docker)
+
+Docker isn't required. MediaSage is Python + FastAPI with no native dependencies, so it runs on any machine with Python 3.11+ — including ARM-based Synology NAS models, Raspberry Pis, or any Linux/macOS/Windows box.
+
+```bash
+git clone https://github.com/ecwilsonaz/mediasage.git
+cd mediasage
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+Set your environment variables:
+
+```bash
+export PLEX_URL=http://your-plex-server:32400
+export PLEX_TOKEN=your-plex-token
+export GEMINI_API_KEY=your-gemini-key
+```
+
+Start the server:
+
+```bash
+uvicorn backend.main:app --host 0.0.0.0 --port 5765
+```
+
+Access at **http://your-machine-ip:5765**.
+
+<details>
+<summary><strong>Running as a background service (systemd)</strong></summary>
+
+To keep MediaSage running after you close your terminal, create a systemd service:
+
+```ini
+# /etc/systemd/system/mediasage.service
+[Unit]
+Description=MediaSage
+After=network.target
+
+[Service]
+Type=simple
+User=your-user
+WorkingDirectory=/path/to/mediasage
+EnvironmentFile=/path/to/mediasage/.env
+ExecStart=/path/to/mediasage/venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 5765
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable mediasage
+sudo systemctl start mediasage
 ```
 
 </details>
@@ -245,11 +322,12 @@ services:
 | `OLLAMA_URL` | No | Ollama server URL (default: `http://localhost:11434`) |
 | `OLLAMA_CONTEXT_WINDOW` | No | Override detected context window for Ollama (default: 32768) |
 | `CUSTOM_LLM_URL` | No | Custom OpenAI-compatible API base URL |
+| `CUSTOM_LLM_API_KEY` | No | API key for custom provider (if required) |
 | `CUSTOM_CONTEXT_WINDOW` | No | Context window size for custom provider (default: 32768) |
 
 ### Web UI Configuration
 
-You can also configure PlexSage through the **Settings** page in the web UI. Settings entered there are saved to `config.user.yaml` and persist across restarts. Environment variables always take priority over UI-saved settings.
+You can also configure MediaSage through the **Settings** page in the web UI. Settings entered there are saved to `config.user.yaml` and persist across restarts. Environment variables always take priority over UI-saved settings.
 
 ### Advanced: config.yaml
 
@@ -271,18 +349,18 @@ defaults:
 
 ### Model Selection
 
-PlexSage uses a two-model strategy by default:
+MediaSage uses a two-model strategy by default:
 
 | Role | Purpose | Models Used |
 |------|---------|-------------|
-| **Analysis** | Interpret prompts (local rules + embeddings, LLM fallback), suggest filters, analyze seed tracks | claude-sonnet-4-5 / gpt-4.1 / gemini-2.5-flash |
+| **Analysis** | Interpret prompts, suggest filters, analyze seed tracks | claude-sonnet-4-5 / gpt-4.1 / gemini-2.5-flash |
 | **Generation** | Select tracks from filtered list | claude-haiku-4-5 / gpt-4.1-mini / gemini-2.5-flash |
 
 This balances quality with cost. Enable `smart_generation: true` to use the analysis model for everything.
 
 ### Local LLM Setup (Experimental)
 
-Run PlexSage with local models for privacy and zero API costs.
+Run MediaSage with local models for privacy and zero API costs.
 
 <details>
 <summary><strong>Ollama</strong></summary>
@@ -292,7 +370,7 @@ Run PlexSage with local models for privacy and zero API costs.
    ollama pull llama3:8b
    ```
 
-2. Configure PlexSage via environment or Settings UI:
+2. Configure MediaSage via environment or Settings UI:
    ```bash
    LLM_PROVIDER=ollama
    OLLAMA_URL=http://localhost:11434
@@ -325,30 +403,28 @@ For LM Studio, text-generation-webui, vLLM, or any OpenAI-compatible server:
 
 ## How It Works
 
-PlexSage uses a **filter-first architecture** designed for large libraries (50,000+ tracks):
+MediaSage uses a **filter-first architecture** designed for large libraries (50,000+ tracks):
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  1. ANALYZE                                                      │
-│     Local rules + embeddings map your prompt → genre/era filters │
-│     Ambiguous prompts fall back to an LLM only when needed       │
+│     LLM interprets your prompt → suggests genre/decade filters   │
 ├─────────────────────────────────────────────────────────────────┤
 │  2. FILTER                                                       │
-│     Local SQLite mirror serves filters + search instantly        │
+│     Plex library narrowed to matching tracks                     │
 │     "90s Alternative" → 2,000 tracks                             │
 ├─────────────────────────────────────────────────────────────────┤
-│  3. PRE-RANK                                                     │
-│     Rule-based scoring keeps the best candidates                 │
-│     Budget scales with prompt specificity: tighter filters and   │
-│     concrete genres send fewer, vague moods send more            │
+│  3. SAMPLE                                                       │
+│     If too large for context, randomly sample                    │
+│     Fits within model's token limits                             │
 ├─────────────────────────────────────────────────────────────────┤
 │  4. GENERATE                                                     │
 │     Filtered track list + prompt sent to LLM                     │
 │     LLM selects best matches from available tracks               │
 ├─────────────────────────────────────────────────────────────────┤
 │  5. MATCH                                                        │
-│     Exact + trigram-pruned fuzzy matching links LLM selections   │
-│     to library tracks                                            │
+│     Fuzzy matching links LLM selections to library               │
+│     Handles minor spelling/formatting differences                │
 ├─────────────────────────────────────────────────────────────────┤
 │  6. SAVE                                                         │
 │     Playlist created in Plex                                     │
@@ -365,8 +441,8 @@ This ensures every track exists in your library while keeping API costs manageab
 ### Local Setup
 
 ```bash
-git clone https://github.com/ecwilsonaz/plexsage.git
-cd plexsage
+git clone https://github.com/ecwilsonaz/mediasage.git
+cd mediasage
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -375,7 +451,7 @@ export PLEX_URL=http://your-plex-server:32400
 export PLEX_TOKEN=your-plex-token
 export GEMINI_API_KEY=your-key
 
-uvicorn backend.main:app --reload --port 8765
+uvicorn backend.main:app --reload --port 5765
 ```
 
 ### Testing
@@ -387,7 +463,6 @@ pytest tests/ -v
 ### Tech Stack
 
 - **Backend:** Python 3.11+, FastAPI, python-plexapi, rapidfuzz, httpx
-- **Local storage:** SQLite (stdlib) mirror of the Plex library for fast filtering/search
 - **Frontend:** Vanilla HTML/CSS/JS (no build step)
 - **LLM SDKs:** anthropic, openai, google-genai (+ Ollama via REST API)
 - **Deployment:** Docker
@@ -402,12 +477,32 @@ Interactive documentation available at `/docs` when running.
 |----------|--------|-------------|
 | `/api/health` | GET | Health check |
 | `/api/config` | GET/POST | Get or update configuration |
+| `/api/setup/status` | GET | Onboarding checklist state |
+| `/api/setup/validate-plex` | POST | Validate Plex credentials |
+| `/api/setup/validate-ai` | POST | Validate AI provider credentials |
+| `/api/setup/complete` | POST | Mark setup wizard as complete |
 | `/api/library/stats` | GET | Library statistics |
-| `/api/library/search` | GET | Search tracks by title/artist/album |
-| `/api/library/sync` | POST | Sync the local SQLite track database from Plex |
+| `/api/library/status` | GET | Cache state, track count, sync progress |
+| `/api/library/sync` | POST | Trigger background library sync |
+| `/api/library/search` | GET | Search library tracks |
 | `/api/analyze/prompt` | POST | Analyze natural language prompt |
+| `/api/analyze/track` | POST | Analyze a seed track |
+| `/api/filter/preview` | POST | Preview filtered track list |
 | `/api/generate` | POST | Generate playlist |
+| `/api/generate/stream` | POST | Stream playlist generation (SSE) |
 | `/api/playlist` | POST | Save playlist to Plex |
+| `/api/playlist/update` | POST | Replace or append to a playlist |
+| `/api/recommend/albums/preview` | GET | Preview album candidates for filters |
+| `/api/recommend/analyze-prompt` | POST | Analyze prompt for genre/decade filters |
+| `/api/recommend/questions` | POST | Generate clarifying questions |
+| `/api/recommend/generate` | POST | Generate album recommendations |
+| `/api/recommend/switch-mode` | POST | Switch library/discovery mode |
+| `/api/results` | GET | List saved result history |
+| `/api/results/{id}` | GET/DELETE | Get or delete a saved result |
+| `/api/plex/clients` | GET | List active Plex clients |
+| `/api/plex/playlists` | GET | List existing Plex playlists |
+| `/api/play-queue` | POST | Send tracks to a Plex client |
+| `/api/art/{rating_key}` | GET | Proxy album art from Plex |
 | `/api/ollama/status` | GET | Ollama connection status |
 | `/api/ollama/models` | GET | List available Ollama models |
 | `/api/ollama/model-info` | GET | Get model details (context window) |
