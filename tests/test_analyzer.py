@@ -4,12 +4,45 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch
 
+from backend.prompt_classifier import PromptClassification
+
+# Forces analyzer.analyze_prompt() down the LLM fallback path so the LLM
+# handling can be tested independently of the local classifier.
+LOW_CONFIDENCE = PromptClassification(
+    genres=[], decades=[], confidence=0.0, method="none", reasoning="forced fallback"
+)
+
+
+def _plex_stats(genres, decades):
+    return {"genres": genres, "decades": decades}
+
 
 class TestPromptAnalysis:
     """Tests for prompt analysis."""
 
-    def test_analyze_prompt_extracts_genres(self, mocker):
-        """Should extract suggested genres from prompt."""
+    def test_analyze_prompt_uses_rules_without_llm(self, mocker):
+        """A clear mood prompt should be classified locally, costing no tokens."""
+        from backend.analyzer import analyze_prompt
+
+        with patch("backend.analyzer.get_llm_client") as mock_llm:
+            with patch("backend.analyzer.get_plex_client") as mock_plex:
+                mock_plex.return_value.get_library_stats.return_value = _plex_stats(
+                    [{"name": "Ambient", "count": 100}, {"name": "Jazz", "count": 200}],
+                    [{"name": "2010s", "count": 150}],
+                )
+
+                result = analyze_prompt("something chill for a rainy day")
+
+                assert result.method == "rules"
+                assert result.confidence > 0
+                assert result.token_count == 0
+                assert result.estimated_cost == 0.0
+                assert "Ambient" in result.suggested_genres
+                # The LLM must not have been consulted at all.
+                mock_llm.return_value.analyze.assert_not_called()
+
+    def test_analyze_prompt_falls_back_to_llm(self, mocker):
+        """Low-confidence prompts should use the LLM fallback."""
         from backend.analyzer import analyze_prompt
         from backend.llm_client import LLMResponse
 
@@ -24,24 +57,25 @@ class TestPromptAnalysis:
             model="test-model"
         )
 
-        with patch("backend.analyzer.get_llm_client") as mock_llm:
-            mock_client = MagicMock()
-            mock_client.analyze.return_value = mock_response
-            mock_client.parse_json_response.return_value = json.loads(mock_response.content)
-            mock_llm.return_value = mock_client
+        with patch("backend.analyzer.classify_prompt", return_value=LOW_CONFIDENCE):
+            with patch("backend.analyzer.get_llm_client") as mock_llm:
+                mock_client = MagicMock()
+                mock_client.analyze.return_value = mock_response
+                mock_client.parse_json_response.return_value = json.loads(mock_response.content)
+                mock_llm.return_value = mock_client
 
-            with patch("backend.analyzer.get_plex_client") as mock_plex:
-                mock_plex_client = MagicMock()
-                mock_plex_client.get_library_stats.return_value = {
-                    "genres": [{"name": "Alternative", "count": 100}, {"name": "Rock", "count": 200}],
-                    "decades": [{"name": "1990s", "count": 150}]
-                }
-                mock_plex.return_value = mock_plex_client
+                with patch("backend.analyzer.get_plex_client") as mock_plex:
+                    mock_plex.return_value.get_library_stats.return_value = _plex_stats(
+                        [{"name": "Alternative", "count": 100}, {"name": "Rock", "count": 200}],
+                        [{"name": "1990s", "count": 150}],
+                    )
 
-                result = analyze_prompt("melancholy 90s alternative")
+                    result = analyze_prompt("melancholy 90s alternative")
 
-                assert "Alternative" in result.suggested_genres
-                assert "1990s" in result.suggested_decades
+                    assert result.method == "llm"
+                    assert "Alternative" in result.suggested_genres
+                    assert "1990s" in result.suggested_decades
+                    mock_client.analyze.assert_called_once()
 
     def test_analyze_prompt_handles_malformed_response(self, mocker):
         """Should handle malformed LLM JSON responses gracefully."""
@@ -55,77 +89,75 @@ class TestPromptAnalysis:
             model="test-model"
         )
 
-        with patch("backend.analyzer.get_llm_client") as mock_llm:
-            mock_client = MagicMock()
-            mock_client.analyze.return_value = mock_response
-            mock_client.parse_json_response.side_effect = ValueError("Invalid JSON")
-            mock_llm.return_value = mock_client
+        with patch("backend.analyzer.classify_prompt", return_value=LOW_CONFIDENCE):
+            with patch("backend.analyzer.get_llm_client") as mock_llm:
+                mock_client = MagicMock()
+                mock_client.analyze.return_value = mock_response
+                mock_client.parse_json_response.side_effect = ValueError("Invalid JSON")
+                mock_llm.return_value = mock_client
 
-            with patch("backend.analyzer.get_plex_client") as mock_plex:
-                mock_plex_client = MagicMock()
-                mock_plex_client.get_library_stats.return_value = {
-                    "genres": [{"name": "Rock", "count": 100}],
-                    "decades": [{"name": "1990s", "count": 100}]
-                }
-                mock_plex.return_value = mock_plex_client
+                with patch("backend.analyzer.get_plex_client") as mock_plex:
+                    mock_plex.return_value.get_library_stats.return_value = _plex_stats(
+                        [{"name": "Rock", "count": 100}],
+                        [{"name": "1990s", "count": 100}],
+                    )
 
-                with pytest.raises(ValueError):
-                    analyze_prompt("test prompt")
+                    with pytest.raises(ValueError):
+                        analyze_prompt("test prompt")
 
     def test_analyze_prompt_returns_available_filters(self, mocker):
         """Should return available genres and decades from library."""
         from backend.analyzer import analyze_prompt
-        from backend.llm_client import LLMResponse
 
-        mock_response = LLMResponse(
-            content=json.dumps({
-                "genres": ["Rock"],
-                "decades": ["1990s"],
-                "reasoning": "Test"
-            }),
-            input_tokens=100,
-            output_tokens=50,
-            model="test-model"
-        )
-
-        with patch("backend.analyzer.get_llm_client") as mock_llm:
-            mock_client = MagicMock()
-            mock_client.analyze.return_value = mock_response
-            mock_client.parse_json_response.return_value = json.loads(mock_response.content)
-            mock_llm.return_value = mock_client
-
+        with patch("backend.analyzer.get_llm_client"):
             with patch("backend.analyzer.get_plex_client") as mock_plex:
-                mock_plex_client = MagicMock()
-                mock_plex_client.get_library_stats.return_value = {
-                    "genres": [
+                mock_plex.return_value.get_library_stats.return_value = _plex_stats(
+                    [
                         {"name": "Rock", "count": 500},
                         {"name": "Jazz", "count": 200},
-                        {"name": "Classical", "count": 100}
+                        {"name": "Classical", "count": 100},
                     ],
-                    "decades": [
+                    [
                         {"name": "1980s", "count": 300},
                         {"name": "1990s", "count": 400},
-                        {"name": "2000s", "count": 200}
-                    ]
-                }
-                mock_plex.return_value = mock_plex_client
+                        {"name": "2000s", "count": 200},
+                    ],
+                )
 
                 result = analyze_prompt("rock music from the 90s")
 
                 # Should include all available options from library
                 assert len(result.available_genres) == 3
                 assert len(result.available_decades) == 3
+                assert "Rock" in result.suggested_genres
+                assert "1990s" in result.suggested_decades
+
+    def test_analyze_prompt_without_llm_still_works(self, mocker):
+        """Rule-based analysis should not require an LLM client to be configured."""
+        from backend.analyzer import analyze_prompt
+
+        with patch("backend.analyzer.get_llm_client", return_value=None):
+            with patch("backend.analyzer.get_plex_client") as mock_plex:
+                mock_plex.return_value.get_library_stats.return_value = _plex_stats(
+                    [{"name": "EDM", "count": 100}, {"name": "Pop", "count": 200}],
+                    [{"name": "2020s", "count": 150}],
+                )
+
+                result = analyze_prompt("party music")
+
+                assert result.method == "rules"
+                assert result.token_count == 0
 
 
 class TestFilterSuggestions:
     """Tests for filter suggestion logic."""
 
     def test_filters_suggest_matching_library_genres(self, mocker):
-        """Suggested genres should match library genres."""
+        """LLM suggestions should be filtered to genres that exist in the library."""
         from backend.analyzer import analyze_prompt
         from backend.llm_client import LLMResponse
 
-        # LLM suggests "Alt Rock" but library has "Alternative"
+        # LLM suggests "Alt Rock" but library has "Grunge"
         mock_response = LLMResponse(
             content=json.dumps({
                 "genres": ["Alt Rock", "Grunge"],
@@ -137,28 +169,28 @@ class TestFilterSuggestions:
             model="test-model"
         )
 
-        with patch("backend.analyzer.get_llm_client") as mock_llm:
-            mock_client = MagicMock()
-            mock_client.analyze.return_value = mock_response
-            mock_client.parse_json_response.return_value = json.loads(mock_response.content)
-            mock_llm.return_value = mock_client
+        with patch("backend.analyzer.classify_prompt", return_value=LOW_CONFIDENCE):
+            with patch("backend.analyzer.get_llm_client") as mock_llm:
+                mock_client = MagicMock()
+                mock_client.analyze.return_value = mock_response
+                mock_client.parse_json_response.return_value = json.loads(mock_response.content)
+                mock_llm.return_value = mock_client
 
-            with patch("backend.analyzer.get_plex_client") as mock_plex:
-                mock_plex_client = MagicMock()
-                mock_plex_client.get_library_stats.return_value = {
-                    "genres": [
-                        {"name": "Alternative", "count": 500},
-                        {"name": "Grunge", "count": 100}
-                    ],
-                    "decades": [{"name": "1990s", "count": 400}]
-                }
-                mock_plex.return_value = mock_plex_client
+                with patch("backend.analyzer.get_plex_client") as mock_plex:
+                    mock_plex.return_value.get_library_stats.return_value = _plex_stats(
+                        [
+                            {"name": "Alternative", "count": 500},
+                            {"name": "Grunge", "count": 100},
+                        ],
+                        [{"name": "1990s", "count": 400}],
+                    )
 
-                result = analyze_prompt("90s alt rock")
+                    result = analyze_prompt("90s alt rock")
 
-                # Grunge should be in suggestions (exact match)
-                # Alt Rock might not be if no fuzzy match
-                assert "Grunge" in result.suggested_genres
+                    # Grunge should be in suggestions (exact library match)
+                    assert "Grunge" in result.suggested_genres
+                    # "Alt Rock" is not a library genre and must be dropped
+                    assert "Alt Rock" not in result.suggested_genres
 
 
 class TestTrackAnalysis:

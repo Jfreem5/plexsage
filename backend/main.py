@@ -306,17 +306,20 @@ async def search_library(q: str = Query(..., description="Search query")) -> lis
 
 @app.post("/api/analyze/prompt", response_model=AnalyzePromptResponse)
 async def analyze_prompt(request: AnalyzePromptRequest) -> AnalyzePromptResponse:
-    """Analyze a natural language prompt to suggest filters."""
+    """Analyze a natural language prompt to suggest filters.
+
+    Uses local rules/embeddings when possible and only falls back to the LLM
+    for ambiguous prompts, so an LLM is not strictly required.
+    """
     plex_client = get_plex_client()
-    llm_client = get_llm_client()
 
     if not plex_client or not plex_client.is_connected():
         raise HTTPException(status_code=503, detail="Plex not connected")
-    if not llm_client:
-        raise HTTPException(status_code=503, detail="LLM not configured")
 
     try:
         return await asyncio.to_thread(do_analyze_prompt, request.prompt)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:

@@ -1,5 +1,9 @@
 """Prompt analysis and seed track dimension extraction."""
 
+import hashlib
+import logging
+from typing import Any
+
 from backend.llm_client import get_llm_client
 from backend.models import (
     AnalyzePromptResponse,
@@ -10,6 +14,10 @@ from backend.models import (
     Track,
 )
 from backend.plex_client import get_plex_client
+from backend.prompt_classifier import classify_prompt
+from backend.track_db import get_track_db
+
+logger = logging.getLogger(__name__)
 
 
 PROMPT_ANALYSIS_SYSTEM = """You are a music expert helping to create playlists from a user's music library.
@@ -55,6 +63,10 @@ Return ONLY valid JSON, no markdown formatting."""
 def analyze_prompt(prompt: str) -> AnalyzePromptResponse:
     """Analyze a natural language prompt to suggest filters.
 
+    Classification is attempted locally first (keyword rules, then embedding
+    similarity).  The LLM is only called as a fallback when the local
+    confidence is low, so the common case costs zero tokens.
+
     Args:
         prompt: User's playlist description
 
@@ -63,13 +75,10 @@ def analyze_prompt(prompt: str) -> AnalyzePromptResponse:
 
     Raises:
         ValueError: If LLM response cannot be parsed
-        RuntimeError: If clients are not initialized
+        RuntimeError: If required clients are not initialized
     """
-    llm_client = get_llm_client()
     plex_client = get_plex_client()
 
-    if not llm_client:
-        raise RuntimeError("LLM client not initialized")
     if not plex_client:
         raise RuntimeError("Plex client not initialized")
 
@@ -77,6 +86,40 @@ def analyze_prompt(prompt: str) -> AnalyzePromptResponse:
     stats = plex_client.get_library_stats()
     available_genres = [GenreCount(**g) for g in stats.get("genres", [])]
     available_decades = [DecadeCount(**d) for d in stats.get("decades", [])]
+
+    # Primary path: local rules + embeddings (no LLM call)
+    classification = classify_prompt(
+        prompt,
+        [g.name for g in available_genres],
+        [d.name for d in available_decades],
+    )
+    if classification.confident:
+        logger.info(
+            "Classified prompt locally via %s (confidence %.2f)",
+            classification.method,
+            classification.confidence,
+        )
+        return AnalyzePromptResponse(
+            suggested_genres=classification.genres,
+            suggested_decades=classification.decades,
+            available_genres=available_genres,
+            available_decades=available_decades,
+            reasoning=classification.reasoning,
+            token_count=0,
+            estimated_cost=0.0,
+            method=classification.method,
+            confidence=classification.confidence,
+        )
+
+    # Fallback path: full LLM analysis
+    llm_client = get_llm_client()
+    if not llm_client:
+        raise RuntimeError("LLM client not initialized")
+
+    logger.info(
+        "Local classification confidence too low (%.2f); falling back to LLM",
+        classification.confidence,
+    )
 
     # Build prompt with available filter context
     analysis_prompt = f"""User's playlist request: "{prompt}"

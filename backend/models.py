@@ -168,6 +168,8 @@ class AnalyzePromptResponse(BaseModel):
     reasoning: str
     token_count: int = 0
     estimated_cost: float = 0.0
+    method: str = "llm"  # "rules", "embeddings", or "llm"
+    confidence: float = 0.0
 
 
 class AnalyzeTrackRequest(BaseModel):
