@@ -185,6 +185,7 @@ class AnalyzeTrackResponse(BaseModel):
     dimensions: list[Dimension]
     token_count: int = 0
     estimated_cost: float = 0.0
+    cached: bool = False
 
 
 class FilterPreviewRequest(BaseModel):
