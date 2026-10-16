@@ -258,6 +258,15 @@ class PlexClient:
             return None
         return db
 
+    def db_available(self) -> bool:
+        """Whether library queries are currently served from the local DB.
+
+        Mirrors the DB-first gate used by the query methods, so callers can
+        tell whether a recent read hit the local TrackDB or fell back to the
+        Plex API.
+        """
+        return self._get_track_db() is not None
+
     def sync_track_db(
         self,
         force: bool = False,

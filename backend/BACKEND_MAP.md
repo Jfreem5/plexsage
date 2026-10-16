@@ -87,6 +87,7 @@ User types prompt
   → POST /api/generate
     → generator.generate_playlist()
       → plex_client.get_tracks_by_filters()  (or random sample)
+      → TrackDB.sync_from_plex()             (only when the read fell back to Plex)
       → generator.compute_track_budget()    (dynamic candidate count from prompt)
       → generator.pre_rank_tracks()          (rules; uses prompt_classifier hints)
       → llm_client.generate()              (selects tracks)
@@ -252,7 +253,9 @@ pre-rank ordering used for deterministic tie-breaking.
 - **Serving reads:** `PlexClient` consults the DB first when it has rows, so
   `get_library_stats`, `get_tracks_by_filters`, `count_tracks_by_filters`,
   `get_random_tracks`, and `search_tracks` avoid Plex HTTP round-trips. Empty or
-  erroring DB → transparent fallback to the Plex API.
+  erroring DB → transparent fallback to the Plex API. `PlexClient.db_available()`
+  exposes the same gate so the generator can tell whether a read was served
+  locally and skip a redundant mirror (`sync_from_plex`) of rows already stored.
 - **Sync:** `PlexClient.sync_track_db()` fetches every track once (rating,
   play count, last-played, live flag) and prunes removed tracks. The app runs it
   on startup and every `SYNC_INTERVAL_SECONDS` (30 min) via a background task in

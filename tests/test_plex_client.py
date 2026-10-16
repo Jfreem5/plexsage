@@ -519,6 +519,23 @@ class TestPlexClientTrackDB:
         mock_library.search.assert_called_once()
         assert len(results) == 1
 
+    def test_db_available_reflects_db_first_gate(self, tmp_path):
+        """db_available mirrors the DB-first gate used by the query methods."""
+        client, _ = self._client()
+
+        populated = tmp_path / "populated"
+        populated.mkdir()
+        with patch("backend.plex_client.get_track_db", return_value=self._make_db(populated)):
+            assert client.db_available() is True
+
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        with patch("backend.plex_client.get_track_db", return_value=self._make_db(empty, populate=False)):
+            assert client.db_available() is False
+
+        with patch("backend.plex_client.get_track_db", return_value=None):
+            assert client.db_available() is False
+
     def test_sync_track_db_populates_metadata(self, tmp_path):
         client, mock_library = self._client()
         db = self._make_db(tmp_path, populate=False)

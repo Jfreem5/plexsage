@@ -252,6 +252,84 @@ class TestPlaylistGeneration:
         assert payload["retained"] < PRE_RANK_LIMIT
 
 
+class TestTrackDbSyncOnGeneration:
+    """Plex fallbacks get mirrored locally; local reads are not re-synced."""
+
+    def _run(self, library, db, db_available, stream=False):
+        """Generate a playlist with a stubbed Plex client and TrackDB."""
+        from backend.generator import generate_playlist, generate_playlist_stream
+        from backend.llm_client import LLMResponse
+
+        response = LLMResponse(
+            content=json.dumps([
+                {"artist": "Radiohead", "album": "The Bends", "title": "Fake Plastic Trees"},
+            ]),
+            input_tokens=10,
+            output_tokens=10,
+            model="test-model",
+        )
+
+        with patch("backend.generator.get_llm_client") as mock_llm:
+            llm_client = MagicMock()
+            llm_client.generate.return_value = response
+            llm_client.parse_json_response.return_value = json.loads(response.content)
+            mock_llm.return_value = llm_client
+
+            with patch("backend.generator.get_plex_client") as mock_plex:
+                plex_client = MagicMock()
+                plex_client.get_tracks_by_filters.return_value = library
+                plex_client.db_available.return_value = db_available
+                mock_plex.return_value = plex_client
+
+                with patch("backend.generator.get_track_db", return_value=db):
+                    kwargs = dict(
+                        prompt="radiohead",
+                        genres=["Alternative"],
+                        decades=["1990s"],
+                        track_count=25,
+                    )
+                    if stream:
+                        list(generate_playlist_stream(**kwargs))
+                    else:
+                        generate_playlist(**kwargs)
+
+    def test_skips_sync_when_read_came_from_db(self, mock_plex_tracks, tmp_path):
+        """A DB-served read is already mirrored; no re-sync or commit."""
+        from backend.track_db import TrackDB
+
+        db = TrackDB(tmp_path / "plexsage.db")
+        db.upsert_tracks(mock_plex_tracks)
+        spy = MagicMock(wraps=db)
+
+        self._run(mock_plex_tracks, spy, db_available=True)
+
+        spy.sync_from_plex.assert_not_called()
+
+    def test_streaming_skips_sync_when_read_came_from_db(self, mock_plex_tracks, tmp_path):
+        """The SSE generation path shares the same skip logic."""
+        from backend.track_db import TrackDB
+
+        db = TrackDB(tmp_path / "plexsage.db")
+        db.upsert_tracks(mock_plex_tracks)
+        spy = MagicMock(wraps=db)
+
+        self._run(mock_plex_tracks, spy, db_available=True, stream=True)
+
+        spy.sync_from_plex.assert_not_called()
+
+    def test_syncs_when_read_fell_back_to_plex(self, mock_plex_tracks, tmp_path):
+        """An empty DB is mirrored with the tracks just fetched from Plex."""
+        from backend.track_db import TrackDB
+
+        db = TrackDB(tmp_path / "plexsage.db")
+        spy = MagicMock(wraps=db)
+
+        self._run(mock_plex_tracks, spy, db_available=False)
+
+        spy.sync_from_plex.assert_called_once_with(mock_plex_tracks)
+        assert db.count_tracks_by_filters() == len(mock_plex_tracks)
+
+
 class TestTrackMatching:
     """Tests for track matching utilities."""
 

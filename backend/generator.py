@@ -343,10 +343,13 @@ def generate_playlist_stream(
             yield emit("error", {"message": "No tracks match the selected filters. Try broadening your selection."})
             return
 
-        # Step 2: Sync to TrackDB and pre-rank
-        db = get_track_db()
-        if db:
-            db.sync_from_plex(filtered_tracks)
+        # Step 2: Mirror Plex-fetched tracks locally, then pre-rank.
+        # A read served by the local DB is already mirrored, so only re-sync
+        # when the fetch above fell back to the Plex API.
+        if not plex_client.db_available():
+            db = get_track_db()
+            if db:
+                db.sync_from_plex(filtered_tracks)
 
         llm_limit = compute_track_budget(
             prompt=prompt,
@@ -542,10 +545,13 @@ def generate_playlist(
     if not filtered_tracks:
         raise ValueError("No tracks match the selected filters. Try broadening your selection.")
 
-    # Sync to TrackDB and pre-rank
-    db = get_track_db()
-    if db:
-        db.sync_from_plex(filtered_tracks)
+    # Mirror Plex-fetched tracks locally, then pre-rank.
+    # A read served by the local DB is already mirrored, so only re-sync when
+    # the fetch above fell back to the Plex API.
+    if not plex_client.db_available():
+        db = get_track_db()
+        if db:
+            db.sync_from_plex(filtered_tracks)
 
     llm_limit = compute_track_budget(
         prompt=prompt,

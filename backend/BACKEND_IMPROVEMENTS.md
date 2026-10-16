@@ -136,9 +136,9 @@ Dynamic max_tracks	20-40% on generation	Low	Low
 The highest-leverage combination is: SQLite track DB (foundation) + two-stage pre-ranking (biggest cost cut) + rule-based prompt classifier (eliminates the cheapest-but-unnecessary LLM call). Together these could reduce total LLM spend by 70-80% while improving speed and reliability.
 
 
-Remaining candidates (not done yet)
+Remaining candidates
 #	Opportunity	Impact	Effort
-A	Skip the redundant db.sync_from_plex() in generator.py (2 call sites) when the read already came from the DB — currently every generation does an extra metadata read + write + commit	lower latency/write load	Low
+A	✅ Implemented: both generation paths only mirror a batch into the DB when the read fell back to the Plex API — `PlexClient.db_available()` reports whether reads are being served locally, so a DB-served generation skips the extra metadata read + write + commit	lower latency/write load	Low
 B	generate_playlist and generate_playlist_stream duplicate ~120 lines (fetch→budget→pre-rank→prompt→LLM→match); the non-streaming path is also missing the track_cache streaming uses. Extract a shared _prepare_generation()	removes drift	Medium
 C	main.py builds the identical ~40-line ConfigResponse twice; extract _config_response(config)	maintainability	Low
 D	Single check_same_thread=False SQLite conn shared across asyncio.to_thread workers with writes not serialized by the existing lock — make thread-safety explicit	robustness	Low–Med
