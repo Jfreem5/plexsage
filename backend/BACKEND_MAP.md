@@ -272,6 +272,11 @@ pre-rank ordering used for deterministic tie-breaking.
   play count, last-played, live flag) and prunes removed tracks. The app runs it
   on startup and every `SYNC_INTERVAL_SECONDS` (30 min) via a background task in
   the `main.py` lifespan; `POST /api/library/sync` triggers it on demand.
+- **Threading:** every thread (including each `asyncio.to_thread` worker) gets
+  its own connection from `_get_conn()`. With WAL, readers run concurrently and
+  never observe a writer's uncommitted batch. Writers go through `_write()`,
+  which holds a re-entrant lock (serializing writers) and rolls back on error.
+  `close()` closes every connection; later use reopens transparently.
 - **Tables:** `tracks` (incl. nullable `embedding` BLOB), `track_genres`,
   `track_dimensions` (cached seed-track analysis: dimensions JSON + model +
   metadata fingerprint), `tracks_fts` (FTS5 over title/artist/album), `meta`

@@ -1,6 +1,7 @@
 """Tests for the SQLite-backed local track database (backend.track_db)."""
 
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -441,6 +442,105 @@ class TestMigrations:
         db.upsert_tracks([_sample_tracks()[0]], is_live_flags=[False])
         assert db.get_track_count() == 1
         assert db.get_tracks_by_filters()[0].is_live is False
+
+
+class TestConcurrency:
+    """Threads get their own connection and writers are serialized."""
+
+    def _batch(self, start: int, count: int) -> list[Track]:
+        return [
+            Track(
+                rating_key=str(start + i),
+                title=f"Track {start + i}",
+                artist="Artist",
+                album="Album",
+                duration_ms=1000,
+                year=2000,
+                genres=["Rock"],
+            )
+            for i in range(count)
+        ]
+
+    def _run_parallel(self, *targets) -> None:
+        """Run *targets* on separate threads, re-raising the first failure."""
+        errors: list[BaseException] = []
+
+        def wrapped(target):
+            try:
+                target()
+            except BaseException as exc:  # re-raised on the main thread
+                errors.append(exc)
+
+        threads = [threading.Thread(target=wrapped, args=(t,)) for t in targets]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise errors[0]
+
+    def test_each_thread_gets_its_own_connection(self, tmp_path):
+        """A connection is not shared across threads (nor recreated per call)."""
+        db = TrackDB(tmp_path / "plex.db")
+        main_conn = db._get_conn()
+
+        holder = {}
+        self._run_parallel(lambda: holder.update(conn=db._get_conn()))
+
+        assert holder["conn"] is not main_conn
+        assert db._get_conn() is main_conn
+
+    def test_concurrent_writers_all_land(self, tmp_path):
+        """Parallel upserts (as asyncio.to_thread does) lose no rows."""
+        db = TrackDB(tmp_path / "plex.db")
+        batches = [self._batch(i * 100, 100) for i in range(8)]
+
+        self._run_parallel(*[lambda b=batch: db.upsert_tracks(b) for batch in batches])
+
+        assert db.get_track_count() == 800
+
+    def test_readers_never_see_a_partial_batch(self, tmp_path):
+        """A batch is visible to other threads wholly or not at all."""
+        db = TrackDB(tmp_path / "plex.db")
+        total = 4000
+        batch = self._batch(0, total)
+
+        seen: set[int] = set()
+        errors: list[BaseException] = []
+        stop = threading.Event()
+        ready = threading.Event()
+
+        def reader():
+            try:
+                # Open this thread's connection *before* the write starts so we
+                # measure isolation, not lock contention on connection creation.
+                assert db.get_track_count() == 0
+                ready.set()
+                while not stop.is_set():
+                    seen.add(db.get_track_count())
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        try:
+            assert ready.wait(timeout=5)
+            db.upsert_tracks(batch)
+        finally:
+            stop.set()
+            thread.join()
+
+        assert not errors, errors
+        assert seen <= {0, total}, f"reader observed a partial batch: {sorted(seen)}"
+        assert db.get_track_count() == total
+
+    def test_use_after_close_reopens_transparently(self, tmp_path):
+        """close() is not terminal: later calls open a fresh connection."""
+        db = TrackDB(tmp_path / "plex.db")
+        db.upsert_tracks(self._batch(0, 3))
+        db.close()
+
+        assert db.get_track_count() == 3
 
 
 class TestHelpers:

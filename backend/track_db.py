@@ -15,8 +15,9 @@ import re
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 from backend.models import Track
 
@@ -109,18 +110,19 @@ class TrackDB:
                      alongside this module.
         """
         self._db_path = Path(db_path) if db_path else _DEFAULT_DB_PATH
-        self._lock = threading.Lock()
-        self._conn: sqlite3.Connection | None = None
+        # Writes are serialized with this lock; each thread owns its own
+        # connection (see _get_conn). Re-entrant because write methods call
+        # one another (e.g. sync_from_plex -> upsert_tracks).
+        self._lock = threading.RLock()
+        self._local = threading.local()
+        self._connections: list[sqlite3.Connection] = []
+        self._generation = 0
         self._fts_enabled = False
         self._init_db()
 
     def _init_db(self) -> None:
         """Create tables, run migrations, and build the FTS index."""
         with self._lock:
-            self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-
             self._conn.executescript("""
                 CREATE TABLE IF NOT EXISTS tracks (
                     rating_key   TEXT PRIMARY KEY,
@@ -170,7 +172,6 @@ class TrackDB:
 
     def _migrate(self) -> None:
         """Add columns introduced after the initial schema."""
-        assert self._conn is not None
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(tracks)")}
         if "embedding" not in columns:
             self._conn.execute("ALTER TABLE tracks ADD COLUMN embedding BLOB")
@@ -186,7 +187,6 @@ class TrackDB:
 
         Falls back to ``LIKE`` queries when FTS5 is unavailable.
         """
-        assert self._conn is not None
         try:
             self._conn.execute(
                 """CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
@@ -210,14 +210,57 @@ class TrackDB:
                 logger.info("TrackDB: backfilling FTS index for %d tracks", track_count)
                 self.rebuild_fts()
 
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        """The calling thread's connection (see :meth:`_get_conn`)."""
+        return self._get_conn()
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open a new connection to the database file."""
+        conn = sqlite3.connect(
+            str(self._db_path),
+            # Statements run on the owning thread; this only allows close() to
+            # tidy up connections opened by worker threads.
+            check_same_thread=False,
+            timeout=30,
+        )
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
+        return conn
+
     def _get_conn(self) -> sqlite3.Connection:
-        """Get the database connection (thread-safe)."""
-        if self._conn is None:
+        """Return this thread's connection, opening one on first use.
+
+        A sqlite3 connection is not safe for concurrent multi-statement work,
+        so each thread owns its own instead of sharing one across the
+        ``asyncio.to_thread`` workers (WAL lets them progress independently).
+        Connections are re-created after :meth:`close`.
+        """
+        local = self._local
+        if getattr(local, "generation", None) != self._generation:
+            conn = self._connect()
+            local.conn = conn
+            local.generation = self._generation
             with self._lock:
-                if self._conn is None:
-                    self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-                    self._conn.execute("PRAGMA journal_mode=WAL")
-        return self._conn
+                self._connections.append(conn)
+        return local.conn
+
+    @contextmanager
+    def _write(self) -> Iterator[sqlite3.Connection]:
+        """Run a write transaction: serialized across threads, rolled back on error.
+
+        The lock keeps two writers from interleaving (or committing) each
+        other's half-applied batch on their separate connections.
+        """
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                yield conn
+            except Exception:
+                conn.rollback()
+                raise
+            conn.commit()
 
     # ------------------------------------------------------------------
     # Write operations
@@ -244,7 +287,6 @@ class TrackDB:
                 at once via :meth:`_replace_fts_bulk` (see that method for why
                 the per-row path is quadratic).
         """
-        assert self._conn is not None
         self._conn.execute(
             """INSERT INTO tracks
                (rating_key, title, artist, album, year, duration_ms,
@@ -302,7 +344,6 @@ class TrackDB:
         """
         if not self._fts_enabled or not tracks:
             return
-        assert self._conn is not None
 
         for chunk in _chunks([t.rating_key for t in tracks]):
             placeholders = ",".join("?" * len(chunk))
@@ -327,10 +368,9 @@ class TrackDB:
             play_count: Total number of plays
             last_played: ISO timestamp of last play, or None
         """
-        conn = self._get_conn()
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        self._upsert_row(track, is_live, user_rating, play_count, last_played, now)
-        conn.commit()
+        with self._write():
+            self._upsert_row(track, is_live, user_rating, play_count, last_played, now)
 
     def upsert_tracks(self, tracks: list[Track],
                       is_live_flags: list[bool] | None = None,
@@ -352,18 +392,18 @@ class TrackDB:
         if not tracks:
             return 0
 
-        conn = self._get_conn()
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-        for i, track in enumerate(tracks):
-            is_live = is_live_flags[i] if is_live_flags and i < len(is_live_flags) else False
-            rating = user_ratings[i] if user_ratings and i < len(user_ratings) else 0
-            plays = play_counts[i] if play_counts and i < len(play_counts) else 0
-            last_play = last_played[i] if last_played and i < len(last_played) else None
-            self._upsert_row(track, is_live, rating, plays, last_play, now, maintain_fts=False)
+        with self._write():
+            for i, track in enumerate(tracks):
+                is_live = is_live_flags[i] if is_live_flags and i < len(is_live_flags) else False
+                rating = user_ratings[i] if user_ratings and i < len(user_ratings) else 0
+                plays = play_counts[i] if play_counts and i < len(play_counts) else 0
+                last_play = last_played[i] if last_played and i < len(last_played) else None
+                self._upsert_row(track, is_live, rating, plays, last_play, now, maintain_fts=False)
 
-        self._replace_fts_bulk(tracks)
-        conn.commit()
+            self._replace_fts_bulk(tracks)
+
         logger.info("Upserted %d tracks into TrackDB", len(tracks))
         return len(tracks)
 
@@ -418,32 +458,30 @@ class TrackDB:
         if not keep:
             return 0
 
-        conn = self._get_conn()
-        existing = [row[0] for row in conn.execute("SELECT rating_key FROM tracks")]
-        removed = [key for key in existing if key not in keep]
-        if not removed:
-            return 0
+        with self._write() as conn:
+            existing = [row[0] for row in conn.execute("SELECT rating_key FROM tracks")]
+            removed = [key for key in existing if key not in keep]
+            if not removed:
+                return 0
 
-        for chunk in _chunks(removed):
-            placeholders = ",".join("?" * len(chunk))
-            conn.execute(f"DELETE FROM track_genres WHERE rating_key IN ({placeholders})", chunk)
-            conn.execute(f"DELETE FROM track_dimensions WHERE rating_key IN ({placeholders})", chunk)
-            if self._fts_enabled:
-                conn.execute(f"DELETE FROM tracks_fts WHERE rating_key IN ({placeholders})", chunk)
-            conn.execute(f"DELETE FROM tracks WHERE rating_key IN ({placeholders})", chunk)
+            for chunk in _chunks(removed):
+                placeholders = ",".join("?" * len(chunk))
+                conn.execute(f"DELETE FROM track_genres WHERE rating_key IN ({placeholders})", chunk)
+                conn.execute(f"DELETE FROM track_dimensions WHERE rating_key IN ({placeholders})", chunk)
+                if self._fts_enabled:
+                    conn.execute(f"DELETE FROM tracks_fts WHERE rating_key IN ({placeholders})", chunk)
+                conn.execute(f"DELETE FROM tracks WHERE rating_key IN ({placeholders})", chunk)
 
-        conn.commit()
         logger.info("Pruned %d tracks removed from Plex", len(removed))
         return len(removed)
 
     def set_embedding(self, rating_key: str, embedding: bytes | None) -> None:
         """Store (or clear) the similarity vector for a track."""
-        conn = self._get_conn()
-        conn.execute(
-            "UPDATE tracks SET embedding = ? WHERE rating_key = ?",
-            (embedding, rating_key),
-        )
-        conn.commit()
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE tracks SET embedding = ? WHERE rating_key = ?",
+                (embedding, rating_key),
+            )
 
     def get_embeddings(self, rating_keys: list[str] | None = None) -> dict[str, bytes]:
         """Return stored embeddings as ``{rating_key: blob}``."""
@@ -485,20 +523,19 @@ class TrackDB:
             model: Analysis model that produced them.
             fingerprint: Hash of the source metadata used for invalidation.
         """
-        conn = self._get_conn()
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        conn.execute(
-            """INSERT INTO track_dimensions
-               (rating_key, dimensions, model, fingerprint, analyzed_at)
-               VALUES (?, ?, ?, ?, ?)
-               ON CONFLICT(rating_key) DO UPDATE SET
-                   dimensions=excluded.dimensions,
-                   model=excluded.model,
-                   fingerprint=excluded.fingerprint,
-                   analyzed_at=excluded.analyzed_at""",
-            (rating_key, json.dumps(dimensions), model, fingerprint, now),
-        )
-        conn.commit()
+        with self._write() as conn:
+            conn.execute(
+                """INSERT INTO track_dimensions
+                   (rating_key, dimensions, model, fingerprint, analyzed_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(rating_key) DO UPDATE SET
+                       dimensions=excluded.dimensions,
+                       model=excluded.model,
+                       fingerprint=excluded.fingerprint,
+                       analyzed_at=excluded.analyzed_at""",
+                (rating_key, json.dumps(dimensions), model, fingerprint, now),
+            )
 
     def get_dimensions(
         self,
@@ -540,15 +577,13 @@ class TrackDB:
 
     def delete_dimensions(self, rating_key: str) -> None:
         """Drop the cached analysis for a single track."""
-        conn = self._get_conn()
-        conn.execute("DELETE FROM track_dimensions WHERE rating_key = ?", (rating_key,))
-        conn.commit()
+        with self._write() as conn:
+            conn.execute("DELETE FROM track_dimensions WHERE rating_key = ?", (rating_key,))
 
     def clear_dimensions(self) -> None:
         """Drop every cached track analysis."""
-        conn = self._get_conn()
-        conn.execute("DELETE FROM track_dimensions")
-        conn.commit()
+        with self._write() as conn:
+            conn.execute("DELETE FROM track_dimensions")
 
     def get_dimension_count(self) -> int:
         """Number of tracks with cached dimensions."""
@@ -562,12 +597,11 @@ class TrackDB:
 
     def set_last_sync(self, timestamp: float | None = None) -> None:
         """Record the time of the most recent successful sync."""
-        conn = self._get_conn()
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_sync', ?)",
-            (str(timestamp if timestamp is not None else time.time()),),
-        )
-        conn.commit()
+        with self._write() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_sync', ?)",
+                (str(timestamp if timestamp is not None else time.time()),),
+            )
 
     def get_last_sync(self) -> float | None:
         """Return the epoch time of the last sync, or None if never synced."""
@@ -814,14 +848,13 @@ class TrackDB:
         """Rebuild the FTS index from the tracks table. Returns row count."""
         if not self._fts_enabled:
             return 0
-        conn = self._get_conn()
-        conn.execute("DELETE FROM tracks_fts")
-        conn.execute(
-            "INSERT INTO tracks_fts (rating_key, title, artist, album) "
-            "SELECT rating_key, title, artist, album FROM tracks"
-        )
-        conn.commit()
-        row = conn.execute("SELECT COUNT(*) FROM tracks_fts").fetchone()
+        with self._write() as conn:
+            conn.execute("DELETE FROM tracks_fts")
+            conn.execute(
+                "INSERT INTO tracks_fts (rating_key, title, artist, album) "
+                "SELECT rating_key, title, artist, album FROM tracks"
+            )
+            row = conn.execute("SELECT COUNT(*) FROM tracks_fts").fetchone()
         return row[0] if row else 0
 
     def get_metadata(self, rating_key: str) -> dict[str, Any] | None:
@@ -926,23 +959,30 @@ class TrackDB:
 
     def clear(self) -> None:
         """Clear all data from the database."""
-        conn = self._get_conn()
-        conn.execute("DELETE FROM tracks")
-        conn.execute("DELETE FROM track_genres")
-        conn.execute("DELETE FROM track_dimensions")
-        conn.execute("DELETE FROM meta")
-        if self._fts_enabled:
-            conn.execute("DELETE FROM tracks_fts")
-        conn.commit()
+        with self._write() as conn:
+            conn.execute("DELETE FROM tracks")
+            conn.execute("DELETE FROM track_genres")
+            conn.execute("DELETE FROM track_dimensions")
+            conn.execute("DELETE FROM meta")
+            if self._fts_enabled:
+                conn.execute("DELETE FROM tracks_fts")
         logger.info("TrackDB cleared")
 
     def close(self) -> None:
-        """Close the database connection."""
+        """Close every connection opened by this database.
+
+        Threads that touch the DB afterwards transparently open a new
+        connection (see :meth:`_get_conn`).
+        """
         with self._lock:
-            if self._conn:
-                self._conn.close()
-                self._conn = None
-                logger.info("TrackDB connection closed")
+            self._generation += 1
+            connections, self._connections = self._connections, []
+            for conn in connections:
+                try:
+                    conn.close()
+                except Exception:
+                    logger.exception("Failed to close TrackDB connection")
+            logger.info("TrackDB connections closed")
 
 
 # Global instance
