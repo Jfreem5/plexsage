@@ -140,7 +140,7 @@ Remaining candidates
 #	Opportunity	Impact	Effort
 A	✅ Implemented: both generation paths only mirror a batch into the DB when the read fell back to the Plex API — `PlexClient.db_available()` reports whether reads are being served locally, so a DB-served generation skips the extra metadata read + write + commit	lower latency/write load	Low
 B	generate_playlist and generate_playlist_stream duplicate ~120 lines (fetch→budget→pre-rank→prompt→LLM→match); the non-streaming path is also missing the track_cache streaming uses. Extract a shared _prepare_generation()	removes drift	Medium
-C	main.py builds the identical ~40-line ConfigResponse twice; extract _config_response(config)	maintainability	Low
+C	✅ Implemented: `main.py` builds every `ConfigResponse` through `_config_response(config)` (with `_is_llm_configured(config)`), shared by `GET`/`POST /api/config` and `/api/health` instead of three copies	maintainability	Low
 D	Single check_same_thread=False SQLite conn shared across asyncio.to_thread workers with writes not serialized by the existing lock — make thread-safety explicit	robustness	Low–Med
 E	sync_track_db() loads all Plex tracks into memory at once; paginate with container_start/container_size	memory on huge libraries	Medium
 F	get_tracks_by_filters sorts by artist/album/title COLLATE NOCASE with no matching index → temp sort each call	query latency	Low

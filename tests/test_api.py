@@ -151,6 +151,23 @@ class TestConfigEndpoints:
 
                     assert response.status_code == 200
 
+    def test_local_provider_configured_without_api_key(self, client):
+        """A local provider URL alone counts as configured, on both endpoints."""
+        with patch("backend.main.get_config") as mock_get_config:
+            with patch("backend.main.get_plex_client") as mock_plex:
+                mock_get_config.return_value = create_mock_config(
+                    llm_provider="ollama", llm_api_key=""
+                )
+                mock_plex.return_value = MagicMock(is_connected=MagicMock(return_value=True))
+
+                health = client.get("/api/health").json()
+                config = client.get("/api/config").json()
+
+        assert health["llm_configured"] is True
+        assert config["llm_configured"] is True
+        assert config["llm_api_key_set"] is False
+        assert config["is_local_provider"] is True
+
 
 class TestIndexPage:
     """Tests for index page serving."""

@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from starlette.responses import StreamingResponse
 import httpx
 
-from backend.config import get_config, update_config_values
+from backend.config import AppConfig, get_config, update_config_values
 from backend.models import (
     AnalyzePromptRequest,
     AnalyzePromptResponse,
@@ -134,11 +134,7 @@ async def health_check() -> HealthResponse:
     plex_connected = plex_client.is_connected() if plex_client else False
 
     # Check if LLM is configured (API key for cloud, URL for local providers)
-    llm_configured = bool(config.llm.api_key)
-    if config.llm.provider == "ollama" and config.llm.ollama_url:
-        llm_configured = True
-    elif config.llm.provider == "custom" and config.llm.custom_url:
-        llm_configured = True
+    llm_configured = _is_llm_configured(config)
 
     return HealthResponse(
         status="healthy",
@@ -152,10 +148,19 @@ async def health_check() -> HealthResponse:
 # =============================================================================
 
 
-@app.get("/api/config", response_model=ConfigResponse)
-async def get_configuration() -> ConfigResponse:
-    """Get current configuration (without secrets)."""
-    config = get_config()
+def _is_llm_configured(config: AppConfig) -> bool:
+    """Whether an LLM is usable: an API key, or a local provider URL."""
+    if config.llm.api_key:
+        return True
+    if config.llm.provider == "ollama" and config.llm.ollama_url:
+        return True
+    if config.llm.provider == "custom" and config.llm.custom_url:
+        return True
+    return False
+
+
+def _config_response(config: AppConfig) -> ConfigResponse:
+    """Build the public configuration response (secrets redacted)."""
     plex_client = get_plex_client()
 
     # Calculate recommended max tracks based on generation model
@@ -168,13 +173,6 @@ async def get_configuration() -> ConfigResponse:
     is_local = config.llm.provider in ("ollama", "custom")
     costs = get_model_cost(generation_model, config.llm)
 
-    # LLM is configured if we have an API key OR if using a local provider with URL
-    llm_configured = bool(config.llm.api_key)
-    if config.llm.provider == "ollama" and config.llm.ollama_url:
-        llm_configured = True
-    elif config.llm.provider == "custom" and config.llm.custom_url:
-        llm_configured = True
-
     # Check if provider is being set by environment variable
     provider_from_env = os.environ.get("LLM_PROVIDER") is not None
 
@@ -184,7 +182,7 @@ async def get_configuration() -> ConfigResponse:
         plex_token_set=bool(config.plex.token),
         music_library=config.plex.music_library,
         llm_provider=config.llm.provider,
-        llm_configured=llm_configured,
+        llm_configured=_is_llm_configured(config),
         llm_api_key_set=bool(config.llm.api_key),
         model_analysis=analysis_model,
         model_generation=generation_model,
@@ -199,6 +197,12 @@ async def get_configuration() -> ConfigResponse:
         is_local_provider=is_local,
         provider_from_env=provider_from_env,
     )
+
+
+@app.get("/api/config", response_model=ConfigResponse)
+async def get_configuration() -> ConfigResponse:
+    """Get current configuration (without secrets)."""
+    return _config_response(get_config())
 
 
 @app.post("/api/config", response_model=ConfigResponse)
@@ -228,49 +232,7 @@ async def update_configuration(request: UpdateConfigRequest) -> ConfigResponse:
     if any(k in updates for k in ["llm_provider", "llm_api_key", "model_analysis", "model_generation", "ollama_url", "custom_url"]):
         init_llm_client(config.llm)
 
-    plex_client = get_plex_client()
-
-    # Calculate recommended max tracks based on generation model
-    generation_model = config.llm.model_generation
-    analysis_model = config.llm.model_analysis
-    max_tracks = get_max_tracks_for_model(generation_model, config=config.llm)
-
-    # Get cost rates for generation model (for client-side cost calculation)
-    # Local providers have zero cost
-    is_local = config.llm.provider in ("ollama", "custom")
-    costs = get_model_cost(generation_model, config.llm)
-
-    # LLM is configured if we have an API key OR if using a local provider with URL
-    llm_configured = bool(config.llm.api_key)
-    if config.llm.provider == "ollama" and config.llm.ollama_url:
-        llm_configured = True
-    elif config.llm.provider == "custom" and config.llm.custom_url:
-        llm_configured = True
-
-    # Check if provider is being set by environment variable
-    provider_from_env = os.environ.get("LLM_PROVIDER") is not None
-
-    return ConfigResponse(
-        plex_url=config.plex.url,
-        plex_connected=plex_client.is_connected() if plex_client else False,
-        plex_token_set=bool(config.plex.token),
-        music_library=config.plex.music_library,
-        llm_provider=config.llm.provider,
-        llm_configured=llm_configured,
-        llm_api_key_set=bool(config.llm.api_key),
-        model_analysis=analysis_model,
-        model_generation=generation_model,
-        max_tracks_to_ai=max_tracks,
-        cost_per_million_input=costs["input"],
-        cost_per_million_output=costs["output"],
-        defaults=config.defaults,
-        ollama_url=config.llm.ollama_url,
-        ollama_context_window=config.llm.ollama_context_window,
-        custom_url=config.llm.custom_url,
-        custom_context_window=config.llm.custom_context_window,
-        is_local_provider=is_local,
-        provider_from_env=provider_from_env,
-    )
+    return _config_response(config)
 
 
 # =============================================================================
