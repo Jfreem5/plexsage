@@ -85,7 +85,7 @@ The result: every track in every playlist exists in your Plex library and plays 
 - "Upbeat instrumental jazz for a dinner party"
 - "Late night electronic, nothing too aggressive"
 
-**Start from a song** — Pick a track you love, then explore musical dimensions: mood, era, instrumentation, genre, production style. Select which qualities you want more of.
+**Start from a song** — Pick a track you love, then explore musical dimensions: mood, era, instrumentation, genre, production style. Select which qualities you want more of. Dimensions are cached locally, so re-analyzing a track (same model) is instant and free.
 
 ### Smart Filtering
 
@@ -275,7 +275,7 @@ PlexSage uses a two-model strategy by default:
 
 | Role | Purpose | Models Used |
 |------|---------|-------------|
-| **Analysis** | Interpret prompts, suggest filters, analyze seed tracks | claude-sonnet-4-5 / gpt-4.1 / gemini-2.5-flash |
+| **Analysis** | Interpret prompts (local rules + embeddings, LLM fallback), suggest filters, analyze seed tracks | claude-sonnet-4-5 / gpt-4.1 / gemini-2.5-flash |
 | **Generation** | Select tracks from filtered list | claude-haiku-4-5 / gpt-4.1-mini / gemini-2.5-flash |
 
 This balances quality with cost. Enable `smart_generation: true` to use the analysis model for everything.
@@ -330,23 +330,25 @@ PlexSage uses a **filter-first architecture** designed for large libraries (50,0
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  1. ANALYZE                                                      │
-│     LLM interprets your prompt → suggests genre/decade filters   │
+│     Local rules + embeddings map your prompt → genre/era filters │
+│     Ambiguous prompts fall back to an LLM only when needed       │
 ├─────────────────────────────────────────────────────────────────┤
 │  2. FILTER                                                       │
-│     Plex library narrowed to matching tracks                     │
+│     Local SQLite mirror serves filters + search instantly        │
 │     "90s Alternative" → 2,000 tracks                             │
 ├─────────────────────────────────────────────────────────────────┤
-│  3. SAMPLE                                                       │
-│     If too large for context, randomly sample                    │
-│     Fits within model's token limits                             │
+│  3. PRE-RANK                                                     │
+│     Rule-based scoring keeps the best candidates                 │
+│     Budget scales with prompt specificity: tighter filters and   │
+│     concrete genres send fewer, vague moods send more            │
 ├─────────────────────────────────────────────────────────────────┤
 │  4. GENERATE                                                     │
 │     Filtered track list + prompt sent to LLM                     │
 │     LLM selects best matches from available tracks               │
 ├─────────────────────────────────────────────────────────────────┤
 │  5. MATCH                                                        │
-│     Fuzzy matching links LLM selections to library               │
-│     Handles minor spelling/formatting differences                │
+│     Exact + trigram-pruned fuzzy matching links LLM selections   │
+│     to library tracks                                            │
 ├─────────────────────────────────────────────────────────────────┤
 │  6. SAVE                                                         │
 │     Playlist created in Plex                                     │
@@ -385,6 +387,7 @@ pytest tests/ -v
 ### Tech Stack
 
 - **Backend:** Python 3.11+, FastAPI, python-plexapi, rapidfuzz, httpx
+- **Local storage:** SQLite (stdlib) mirror of the Plex library for fast filtering/search
 - **Frontend:** Vanilla HTML/CSS/JS (no build step)
 - **LLM SDKs:** anthropic, openai, google-genai (+ Ollama via REST API)
 - **Deployment:** Docker
@@ -400,6 +403,8 @@ Interactive documentation available at `/docs` when running.
 | `/api/health` | GET | Health check |
 | `/api/config` | GET/POST | Get or update configuration |
 | `/api/library/stats` | GET | Library statistics |
+| `/api/library/search` | GET | Search tracks by title/artist/album |
+| `/api/library/sync` | POST | Sync the local SQLite track database from Plex |
 | `/api/analyze/prompt` | POST | Analyze natural language prompt |
 | `/api/generate` | POST | Generate playlist |
 | `/api/playlist` | POST | Save playlist to Plex |
