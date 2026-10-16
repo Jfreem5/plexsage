@@ -167,6 +167,73 @@ class TestFiltering:
         assert "Champagne Supernova - Live" not in titles
 
 
+class TestSortIndex:
+    """The covering sort index serves get_tracks_by_filters' ORDER BY."""
+
+    def _many_tracks(self, tmp_path, count=200):
+        db = TrackDB(tmp_path / "plex.db")
+        db.upsert_tracks(
+            [
+                Track(
+                    rating_key=str(i),
+                    title=f"Track {i:03d}",
+                    artist=f"Artist {i % 7}",
+                    album=f"Album {i % 5}",
+                    duration_ms=1000,
+                    year=1990 + (i % 30),
+                    genres=["Rock" if i % 2 else "Jazz"],
+                )
+                for i in range(count)
+            ],
+            is_live_flags=[i % 10 == 0 for i in range(count)],
+            user_ratings=[i % 11 for i in range(count)],
+        )
+        return db
+
+    def test_listing_is_sorted_case_insensitively(self, tmp_path):
+        """The ordering the index exists to serve: NOCASE artist/album/title."""
+        db = TrackDB(tmp_path / "plex.db")
+        db.upsert_tracks(
+            [
+                Track(rating_key="1", title="Zebra", artist="banana", album="Zoo",
+                      duration_ms=1, year=2000, genres=[]),
+                Track(rating_key="2", title="Apple", artist="Apple", album="apple",
+                      duration_ms=1, year=2000, genres=[]),
+                Track(rating_key="3", title="Banana", artist="banana", album="apple",
+                      duration_ms=1, year=2000, genres=[]),
+            ]
+        )
+        # Apple < banana (a BINARY sort would place "Zoo" before "apple").
+        assert [t.rating_key for t in db.get_tracks_by_filters()] == ["2", "3", "1"]
+
+    def test_index_leads_with_nocase_sort_columns(self, tmp_path):
+        db = self._many_tracks(tmp_path, count=1)
+        # index_xinfo rows are (seqno, cid, name, desc, coll, key).
+        keyed = [
+            (row[2], row[4])
+            for row in db._get_conn().execute("PRAGMA index_xinfo(idx_tracks_nocase_sort)")
+            if row[5]
+        ]
+        assert keyed[:3] == [("artist", "NOCASE"), ("album", "NOCASE"), ("title", "NOCASE")]
+        # Selected and filtered columns ride along so the scan stays covering.
+        assert {"rating_key", "year", "duration_ms", "is_live", "user_rating"} <= {
+            name for name, _ in keyed
+        }
+
+    @pytest.mark.parametrize(
+        "genres,min_rating",
+        [(None, 0), (["Rock"], 0), (["Rock", "Jazz"], 0), (None, 8)],
+    )
+    def test_filter_query_is_served_by_the_sort_index(self, tmp_path, genres, min_rating):
+        """No temp b-tree for the common filters; the index order is reused."""
+        db = self._many_tracks(tmp_path)
+        where, params = db._build_where(genres, None, True, min_rating)
+        sql = "EXPLAIN QUERY PLAN " + db._filter_query(where)
+        plan = [row[3] for row in db._get_conn().execute(sql, params)]
+        assert not any("TEMP B-TREE" in step for step in plan), plan
+        assert any("idx_tracks_nocase_sort" in step for step in plan), plan
+
+
 class TestSearch:
     """Full-text search over title, artist, and album."""
 
@@ -437,6 +504,10 @@ class TestMigrations:
         db = TrackDB(path)
         columns = {row[1] for row in db._get_conn().execute("PRAGMA table_info(tracks)")}
         assert {"is_live", "embedding"} <= columns
+
+        # The covering sort index is built after the migration adds is_live.
+        indexes = {row[1] for row in db._get_conn().execute("PRAGMA index_list(tracks)")}
+        assert "idx_tracks_nocase_sort" in indexes
 
         # And the migrated column is usable end-to-end.
         db.upsert_tracks([_sample_tracks()[0]], is_live_flags=[False])

@@ -284,6 +284,12 @@ pre-rank ordering used for deterministic tie-breaking.
   `track_dimensions` (cached seed-track analysis: dimensions JSON + model +
   metadata fingerprint), `tracks_fts` (FTS5 over title/artist/album), `meta`
   (last sync time).
+- **Indexes:** `idx_tracks_nocase_sort` is a covering index whose leading
+  columns are the `COLLATE NOCASE` sort expressions of
+  `TrackDB.get_tracks_by_filters`, so the filtered listing is read in index
+  order (no temp b-tree) with no table lookups; it is created after
+  `_migrate()` because it includes `is_live`. A selective decade range still
+  filters via `idx_tracks_year` and sorts the few survivors.
 - **Migrations:** missing columns are added on startup (`_migrate`); the FTS
   index is backfilled when empty.
 

@@ -166,6 +166,16 @@ class TrackDB:
             """)
 
             self._migrate()
+            # Covering index for the filtered track listing: the sort
+            # expressions lead (so ORDER BY ... COLLATE NOCASE is served in
+            # index order instead of a temp b-tree) and every selected and
+            # filtered column trails (so the scan needs no table lookups).
+            # Created after _migrate() because it references is_live.
+            self._conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_tracks_nocase_sort
+                   ON tracks(artist COLLATE NOCASE, album COLLATE NOCASE, title COLLATE NOCASE,
+                             rating_key, year, duration_ms, is_live, user_rating)"""
+            )
             self._init_fts()
             self._conn.commit()
             logger.info("TrackDB initialized at %s", self._db_path)
@@ -706,6 +716,22 @@ class TrackDB:
 
         return where, params
 
+    def _filter_query(self, where: list[str]) -> str:
+        """SQL for a filtered track listing (see :meth:`get_tracks_by_filters`).
+
+        The ``ORDER BY`` matches the leading columns of
+        ``idx_tracks_nocase_sort``; keep the two in step.
+        """
+        sql = (
+            "SELECT t.rating_key, t.title, t.artist, t.album, t.year, t.duration_ms, t.is_live "
+            "FROM tracks t"
+        )
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        return sql + (
+            " ORDER BY t.artist COLLATE NOCASE, t.album COLLATE NOCASE, t.title COLLATE NOCASE"
+        )
+
     def get_tracks_by_filters(
         self,
         genres: list[str] | None = None,
@@ -718,13 +744,7 @@ class TrackDB:
         conn = self._get_conn()
         where, params = self._build_where(genres, decades, exclude_live, min_rating)
 
-        sql = (
-            "SELECT t.rating_key, t.title, t.artist, t.album, t.year, t.duration_ms, t.is_live "
-            "FROM tracks t"
-        )
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY t.artist COLLATE NOCASE, t.album COLLATE NOCASE, t.title COLLATE NOCASE"
+        sql = self._filter_query(where)
         if limit:
             sql += " LIMIT ?"
             params.append(limit)
