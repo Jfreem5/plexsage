@@ -4,7 +4,8 @@ import json
 import logging
 import math
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
+from dataclasses import dataclass
 from datetime import datetime
 
 from backend.llm_client import get_llm_client
@@ -22,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 # Maximum number of tracks sent to the LLM after pre-ranking
 PRE_RANK_LIMIT = 500
+
+# Random sample size when a request has no filters (avoids loading the library)
+SAMPLE_SIZE = 2000
 
 
 # =============================================================================
@@ -263,6 +267,178 @@ def pre_rank_tracks(
     return [t for _, t in scored[:max_tracks]]
 
 
+@dataclass
+class _PreparedGeneration:
+    """Candidates and prompt produced by the shared preparation stage."""
+
+    candidates: list[Track]
+    prompt: str
+
+
+def _noop_emit(event: str, data: dict) -> str:
+    """Progress sink for callers that don't stream (the non-SSE path)."""
+    return ""
+
+
+def _collect_preparation(
+    preparation: Generator[str, None, _PreparedGeneration],
+) -> _PreparedGeneration:
+    """Drive a preparation generator to completion, discarding progress events."""
+    try:
+        while True:
+            next(preparation)
+    except StopIteration as stop:
+        return stop.value
+
+
+def _prepare_generation(
+    emit: Callable[[str, dict], str],
+    plex_client,
+    *,
+    prompt: str | None,
+    seed_track: Track | None,
+    selected_dimensions: list[str] | None,
+    additional_notes: str | None,
+    genres: list[str] | None,
+    decades: list[str] | None,
+    track_count: int,
+    exclude_live: bool,
+    min_rating: int,
+    max_tracks_to_ai: int,
+) -> Generator[str, None, _PreparedGeneration]:
+    """Fetch candidates, mirror them locally, pre-rank, and build the LLM prompt.
+
+    Shared by the streaming and non-streaming generation paths. Progress events
+    are formatted with *emit* and yielded; the pre-ranked candidates and the
+    finished prompt are returned when the generator completes.
+
+    Raises:
+        PlexQueryError: The Plex API could not serve the request.
+        ValueError: No track matched the selection.
+    """
+    has_filters = genres or decades or min_rating > 0
+
+    # Step 1: Fetch tracks. Unfiltered requests sample randomly (so repeat
+    # generations differ); filtered requests reuse the short-lived cache.
+    if not has_filters:
+        yield emit("progress", {"step": "fetching", "message": "Sampling random tracks from library..."})
+        logger.info("No filters applied, fetching %d random tracks", SAMPLE_SIZE)
+        filtered_tracks = plex_client.get_random_tracks(
+            count=SAMPLE_SIZE,
+            exclude_live=exclude_live,
+        )
+        logger.info("Got %d random tracks", len(filtered_tracks))
+    else:
+        track_cache = get_track_cache()
+        cached_tracks = track_cache.get(genres, decades, exclude_live, min_rating)
+
+        if cached_tracks is not None:
+            yield emit("progress", {"step": "cache_hit", "message": "Using cached library results..."})
+            filtered_tracks = cached_tracks
+            logger.info("Using %d cached tracks", len(filtered_tracks))
+        else:
+            yield emit("progress", {"step": "fetching", "message": "Fetching tracks from library..."})
+            logger.info("Fetching tracks with filters: genres=%s, decades=%s, min_rating=%s", genres, decades, min_rating)
+            filtered_tracks = plex_client.get_tracks_by_filters(
+                genres=genres,
+                decades=decades,
+                exclude_live=exclude_live,
+                min_rating=min_rating,
+            )
+            # Cache for potential future use
+            track_cache.set(genres, decades, exclude_live, min_rating, filtered_tracks)
+            logger.info("Found %d tracks matching filters", len(filtered_tracks))
+
+    if not filtered_tracks:
+        raise ValueError("No tracks match the selected filters. Try broadening your selection.")
+
+    # Step 2: Mirror a Plex-served batch locally, then pre-rank. A read served
+    # by the local DB is already mirrored, so only re-sync on a Plex fallback.
+    if not plex_client.db_available():
+        db = get_track_db()
+        if db:
+            db.sync_from_plex(filtered_tracks)
+
+    llm_limit = compute_track_budget(
+        prompt=prompt,
+        requested_max=max_tracks_to_ai,
+        track_count=track_count,
+        pool_size=len(filtered_tracks),
+        genres=genres,
+        decades=decades,
+    )
+    logger.info("Pre-ranking %d candidates, retaining %d", len(filtered_tracks), llm_limit)
+    yield emit("progress", {"step": "pre_ranking", "message": f"Ranking {len(filtered_tracks)} candidates…", "candidates": len(filtered_tracks), "retained": llm_limit})
+    pre_rank_filters = FilterSet(genres=genres or [], decades=decades or []) if has_filters else None
+    candidates = pre_rank_tracks(filtered_tracks, prompt, filters=pre_rank_filters, max_tracks=llm_limit)
+
+    # Step 3: Build the prompt from the pre-ranked candidates.
+    yield emit("progress", {"step": "preparing", "message": f"Preparing {len(candidates)} tracks for AI..."})
+
+    track_list = "\n".join(
+        f"{i+1}. {t.artist} - {t.title} ({t.album}, {t.year or 'Unknown year'})"
+        for i, t in enumerate(candidates)
+    )
+
+    generation_parts = []
+
+    if prompt:
+        generation_parts.append(f"User's request: {prompt}")
+
+    if seed_track:
+        generation_parts.append(
+            f"Seed track: {seed_track.title} by {seed_track.artist} "
+            f"(from {seed_track.album}, {seed_track.year or 'Unknown year'})"
+        )
+        if selected_dimensions:
+            generation_parts.append(f"Explore these dimensions: {', '.join(selected_dimensions)}")
+
+    if additional_notes:
+        generation_parts.append(f"Additional notes: {additional_notes}")
+
+    generation_parts.append(f"\nSelect {track_count} tracks from this library:\n{track_list}")
+
+    return _PreparedGeneration(
+        candidates=candidates,
+        prompt="\n\n".join(generation_parts),
+    )
+
+
+def _match_selections(
+    candidates: list[Track],
+    selections: list[dict],
+    track_count: int,
+    seed_track: Track | None,
+) -> list[Track]:
+    """Resolve the LLM's ``{artist, title}`` picks against the candidates.
+
+    Indexes the candidates once (exact match first, then trigram-pruned fuzzy)
+    and returns the matching tracks in selection order, excluding the seed.
+    """
+    matched_tracks: list[Track] = []
+    used_keys: set[str] = set()
+
+    if seed_track:
+        used_keys.add(seed_track.rating_key)
+
+    matcher = TrackMatcher(candidates)
+
+    for selection in selections:
+        if len(matched_tracks) >= track_count:
+            break
+
+        track = matcher.match(
+            selection.get("artist", ""),
+            selection.get("title", ""),
+            used_keys,
+        )
+        if track is not None:
+            matched_tracks.append(track)
+            used_keys.add(track.rating_key)
+
+    return matched_tracks
+
+
 def generate_playlist_stream(
     prompt: str | None = None,
     seed_track: Track | None = None,
@@ -294,109 +470,30 @@ def generate_playlist_stream(
             yield emit("error", {"message": "Plex client not initialized"})
             return
 
-        track_cache = get_track_cache()
-        has_filters = genres or decades or min_rating > 0
-
-        # Step 1: Fetch tracks - use random sampling when no filters to avoid loading entire library
-        if not has_filters:
-            # No filters - use efficient random sampling
-            yield emit("progress", {"step": "fetching", "message": "Sampling random tracks from library..."})
-            sample_size = 2000
-            logger.info("No filters applied, fetching %d random tracks", sample_size)
-            try:
-                filtered_tracks = plex_client.get_random_tracks(
-                    count=sample_size,
-                    exclude_live=exclude_live,
-                )
-            except PlexQueryError as e:
-                yield emit("error", {"message": f"Plex server error: {e}"})
-                return
-            logger.info("Got %d random tracks", len(filtered_tracks))
-        else:
-            # Filters applied - check cache or fetch with filters
-            cached_tracks = track_cache.get(genres, decades, exclude_live, min_rating)
-
-            if cached_tracks is not None:
-                yield emit("progress", {"step": "cache_hit", "message": "Using cached library results..."})
-                filtered_tracks = cached_tracks
-                logger.info("Using %d cached tracks", len(filtered_tracks))
-            else:
-                yield emit("progress", {"step": "fetching", "message": "Fetching tracks from library..."})
-
-                logger.info("Fetching tracks with filters: genres=%s, decades=%s, min_rating=%s", genres, decades, min_rating)
-                try:
-                    filtered_tracks = plex_client.get_tracks_by_filters(
-                        genres=genres,
-                        decades=decades,
-                        exclude_live=exclude_live,
-                        min_rating=min_rating,
-                    )
-                    # Cache for potential future use
-                    track_cache.set(genres, decades, exclude_live, min_rating, filtered_tracks)
-                except PlexQueryError as e:
-                    yield emit("error", {"message": f"Plex server error: {e}"})
-                    return
-
-                logger.info("Found %d tracks matching filters", len(filtered_tracks))
-
-        if not filtered_tracks:
-            yield emit("error", {"message": "No tracks match the selected filters. Try broadening your selection."})
-            return
-
-        # Step 2: Mirror Plex-fetched tracks locally, then pre-rank.
-        # A read served by the local DB is already mirrored, so only re-sync
-        # when the fetch above fell back to the Plex API.
-        if not plex_client.db_available():
-            db = get_track_db()
-            if db:
-                db.sync_from_plex(filtered_tracks)
-
-        llm_limit = compute_track_budget(
-            prompt=prompt,
-            requested_max=max_tracks_to_ai,
-            track_count=track_count,
-            pool_size=len(filtered_tracks),
-            genres=genres,
-            decades=decades,
-        )
-        yield emit("progress", {"step": "pre_ranking", "message": f"Ranking {len(filtered_tracks)} candidates…", "candidates": len(filtered_tracks), "retained": llm_limit})
-        pre_rank_filters = FilterSet(genres=genres or [], decades=decades or []) if has_filters else None
-        filtered_tracks = pre_rank_tracks(filtered_tracks, prompt, filters=pre_rank_filters, max_tracks=llm_limit)
-
-        # Step 3: Build track list
-        yield emit("progress", {"step": "preparing", "message": f"Preparing {len(filtered_tracks)} tracks for AI..."})
-
-        track_list = "\n".join(
-            f"{i+1}. {t.artist} - {t.title} ({t.album}, {t.year or 'Unknown year'})"
-            for i, t in enumerate(filtered_tracks)
-        )
-
-        # Build the generation prompt
-        generation_parts = []
-
-        if prompt:
-            generation_parts.append(f"User's request: {prompt}")
-
-        if seed_track:
-            generation_parts.append(
-                f"Seed track: {seed_track.title} by {seed_track.artist} "
-                f"(from {seed_track.album}, {seed_track.year or 'Unknown year'})"
+        try:
+            prepared = yield from _prepare_generation(
+                emit,
+                plex_client,
+                prompt=prompt,
+                seed_track=seed_track,
+                selected_dimensions=selected_dimensions,
+                additional_notes=additional_notes,
+                genres=genres,
+                decades=decades,
+                track_count=track_count,
+                exclude_live=exclude_live,
+                min_rating=min_rating,
+                max_tracks_to_ai=max_tracks_to_ai,
             )
-            if selected_dimensions:
-                generation_parts.append(f"Explore these dimensions: {', '.join(selected_dimensions)}")
-
-        if additional_notes:
-            generation_parts.append(f"Additional notes: {additional_notes}")
-
-        generation_parts.append(f"\nSelect {track_count} tracks from this library:\n{track_list}")
-
-        generation_prompt = "\n\n".join(generation_parts)
+        except PlexQueryError as e:
+            yield emit("error", {"message": f"Plex server error: {e}"})
+            return
 
         # Step 4: Call LLM
         yield emit("progress", {"step": "ai_working", "message": "AI is curating your playlist..."})
 
-        logger.info("Calling LLM with prompt length: %d chars", len(generation_prompt))
-        response = llm_client.generate(generation_prompt, GENERATION_SYSTEM)
+        logger.info("Calling LLM with prompt length: %d chars", len(prepared.prompt))
+        response = llm_client.generate(prepared.prompt, GENERATION_SYSTEM)
         logger.info("LLM response received: %d input, %d output tokens", response.input_tokens, response.output_tokens)
 
         # Step 5: Parse response
@@ -411,25 +508,9 @@ def generate_playlist_stream(
         # Step 6: Match tracks
         yield emit("progress", {"step": "matching", "message": f"Matching {len(track_selections)} selections to library..."})
 
-        matched_tracks: list[Track] = []
-        used_keys: set[str] = set()
-
-        if seed_track:
-            used_keys.add(seed_track.rating_key)
-
-        matcher = TrackMatcher(filtered_tracks)
-
-        for selection in track_selections:
-            if len(matched_tracks) >= track_count:
-                break
-
-            artist = selection.get("artist", "")
-            title = selection.get("title", "")
-
-            track = matcher.match(artist, title, used_keys)
-            if track is not None:
-                matched_tracks.append(track)
-                used_keys.add(track.rating_key)
+        matched_tracks = _match_selections(
+            prepared.candidates, track_selections, track_count, seed_track
+        )
 
         # Step 7: Complete
         yield emit("progress", {"step": "complete", "message": "Playlist ready!"})
@@ -512,90 +593,29 @@ def generate_playlist(
     if not plex_client:
         raise RuntimeError("Plex client not initialized")
 
-    # Get tracks from library
-    has_filters = genres or decades or min_rating > 0
-
-    if not has_filters:
-        # No filters - use efficient random sampling
-        sample_size = 2000
-        logger.info("No filters applied, fetching %d random tracks", sample_size)
-        try:
-            filtered_tracks = plex_client.get_random_tracks(
-                count=sample_size,
-                exclude_live=exclude_live,
-            )
-        except PlexQueryError as e:
-            raise RuntimeError(f"Plex server error while fetching tracks: {e}") from e
-        logger.info("Got %d random tracks", len(filtered_tracks))
-    else:
-        # Filters applied - fetch with filters
-        logger.info("Fetching tracks with filters: genres=%s, decades=%s, min_rating=%s", genres, decades, min_rating)
-        try:
-            filtered_tracks = plex_client.get_tracks_by_filters(
-                genres=genres,
-                decades=decades,
-                exclude_live=exclude_live,
-                min_rating=min_rating,
-            )
-        except PlexQueryError as e:
-            raise RuntimeError(f"Plex server error while fetching tracks: {e}") from e
-
-        logger.info("Found %d tracks matching filters", len(filtered_tracks))
-
-    if not filtered_tracks:
-        raise ValueError("No tracks match the selected filters. Try broadening your selection.")
-
-    # Mirror Plex-fetched tracks locally, then pre-rank.
-    # A read served by the local DB is already mirrored, so only re-sync when
-    # the fetch above fell back to the Plex API.
-    if not plex_client.db_available():
-        db = get_track_db()
-        if db:
-            db.sync_from_plex(filtered_tracks)
-
-    llm_limit = compute_track_budget(
+    # Fetch → mirror → pre-rank → prompt is shared with the streaming path.
+    preparation = _prepare_generation(
+        _noop_emit,
+        plex_client,
         prompt=prompt,
-        requested_max=max_tracks_to_ai,
-        track_count=track_count,
-        pool_size=len(filtered_tracks),
+        seed_track=seed_track,
+        selected_dimensions=selected_dimensions,
+        additional_notes=additional_notes,
         genres=genres,
         decades=decades,
+        track_count=track_count,
+        exclude_live=exclude_live,
+        min_rating=min_rating,
+        max_tracks_to_ai=max_tracks_to_ai,
     )
-    logger.info("Pre-ranking %d candidates, retaining %d", len(filtered_tracks), llm_limit)
-    pre_rank_filters = FilterSet(genres=genres or [], decades=decades or []) if has_filters else None
-    filtered_tracks = pre_rank_tracks(filtered_tracks, prompt, filters=pre_rank_filters, max_tracks=llm_limit)
-
-    # Build the track list for the LLM
-    logger.debug("Building track list for %d tracks", len(filtered_tracks))
-    track_list = "\n".join(
-        f"{i+1}. {t.artist} - {t.title} ({t.album}, {t.year or 'Unknown year'})"
-        for i, t in enumerate(filtered_tracks)
-    )
-
-    # Build the generation prompt
-    generation_parts = []
-
-    if prompt:
-        generation_parts.append(f"User's request: {prompt}")
-
-    if seed_track:
-        generation_parts.append(
-            f"Seed track: {seed_track.title} by {seed_track.artist} "
-            f"(from {seed_track.album}, {seed_track.year or 'Unknown year'})"
-        )
-        if selected_dimensions:
-            generation_parts.append(f"Explore these dimensions: {', '.join(selected_dimensions)}")
-
-    if additional_notes:
-        generation_parts.append(f"Additional notes: {additional_notes}")
-
-    generation_parts.append(f"\nSelect {track_count} tracks from this library:\n{track_list}")
-
-    generation_prompt = "\n\n".join(generation_parts)
+    try:
+        prepared = _collect_preparation(preparation)
+    except PlexQueryError as e:
+        raise RuntimeError(f"Plex server error while fetching tracks: {e}") from e
 
     # Call LLM
-    logger.info("Calling LLM with prompt length: %d chars", len(generation_prompt))
-    response = llm_client.generate(generation_prompt, GENERATION_SYSTEM)
+    logger.info("Calling LLM with prompt length: %d chars", len(prepared.prompt))
+    response = llm_client.generate(prepared.prompt, GENERATION_SYSTEM)
     logger.info("LLM response received: %d input, %d output tokens", response.input_tokens, response.output_tokens)
 
     # Parse response
@@ -605,28 +625,9 @@ def generate_playlist(
     if not isinstance(track_selections, list):
         raise ValueError("LLM returned invalid track selection format")
 
-    # Match LLM selections to library tracks
-    matched_tracks: list[Track] = []
-    used_keys: set[str] = set()
-
-    # Exclude seed track if present
-    if seed_track:
-        used_keys.add(seed_track.rating_key)
-
-    # Index the candidates once: exact match first, then trigram-pruned fuzzy.
-    matcher = TrackMatcher(filtered_tracks)
-
-    for selection in track_selections:
-        if len(matched_tracks) >= track_count:
-            break
-
-        artist = selection.get("artist", "")
-        title = selection.get("title", "")
-
-        track = matcher.match(artist, title, used_keys)
-        if track is not None:
-            matched_tracks.append(track)
-            used_keys.add(track.rating_key)
+    matched_tracks = _match_selections(
+        prepared.candidates, track_selections, track_count, seed_track
+    )
 
     return GenerateResponse(
         tracks=matched_tracks,

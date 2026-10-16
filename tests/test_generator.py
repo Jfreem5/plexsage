@@ -330,6 +330,107 @@ class TestTrackDbSyncOnGeneration:
         assert db.count_tracks_by_filters() == len(mock_plex_tracks)
 
 
+class TestSharedPreparation:
+    """Both generation paths share one fetch → rank → prompt stage."""
+
+    def _clients(self, tracks):
+        from backend.llm_client import LLMResponse
+
+        response = LLMResponse(
+            content=json.dumps([
+                {"artist": "Radiohead", "title": "Fake Plastic Trees"},
+            ]),
+            input_tokens=1,
+            output_tokens=1,
+            model="test-model",
+        )
+        llm = MagicMock()
+        llm.generate.return_value = response
+        llm.parse_json_response.return_value = json.loads(response.content)
+
+        plex = MagicMock()
+        plex.get_tracks_by_filters.return_value = tracks
+        return llm, plex
+
+    def test_non_streaming_path_uses_track_cache(self, mock_plex_tracks):
+        """Repeat non-streaming generations reuse cached library results.
+
+        The non-streaming path used to skip the cache entirely.
+        """
+        from backend.generator import generate_playlist
+
+        llm, plex = self._clients(mock_plex_tracks)
+
+        with patch("backend.generator.get_llm_client", return_value=llm):
+            with patch("backend.generator.get_plex_client", return_value=plex):
+                generate_playlist(genres=["Alternative"], decades=["1990s"], track_count=5)
+                generate_playlist(genres=["Alternative"], decades=["1990s"], track_count=5)
+
+        assert plex.get_tracks_by_filters.call_count == 1
+
+    def test_streaming_and_non_streaming_share_the_cache(self, mock_plex_tracks):
+        """A streaming fetch warms the cache the non-streaming path reuses."""
+        from backend.generator import generate_playlist, generate_playlist_stream
+
+        llm, plex = self._clients(mock_plex_tracks)
+
+        with patch("backend.generator.get_llm_client", return_value=llm):
+            with patch("backend.generator.get_plex_client", return_value=plex):
+                list(generate_playlist_stream(
+                    genres=["Alternative"], decades=["1990s"], track_count=5
+                ))
+                generate_playlist(genres=["Alternative"], decades=["1990s"], track_count=5)
+
+        assert plex.get_tracks_by_filters.call_count == 1
+
+    def test_streaming_event_order_is_unchanged(self, mock_plex_tracks):
+        """The shared stage emits the same progress sequence as before."""
+        from backend.generator import generate_playlist_stream
+
+        llm, plex = self._clients(mock_plex_tracks)
+
+        with patch("backend.generator.get_llm_client", return_value=llm):
+            with patch("backend.generator.get_plex_client", return_value=plex):
+                events = list(generate_playlist_stream(
+                    genres=["Alternative"], decades=["1990s"], track_count=5
+                ))
+
+        steps = [
+            json.loads(event.split("data: ", 1)[1])["step"]
+            for event in events
+            if event.startswith("event: progress")
+        ]
+        assert steps == [
+            "fetching",
+            "pre_ranking",
+            "preparing",
+            "ai_working",
+            "parsing",
+            "matching",
+            "complete",
+        ]
+
+    def test_both_paths_report_no_matches(self):
+        """Empty results surface the same message from both paths."""
+        from backend.generator import generate_playlist, generate_playlist_stream
+
+        llm, plex = self._clients([])
+        plex.db_available.return_value = False
+
+        with patch("backend.generator.get_llm_client", return_value=llm):
+            with patch("backend.generator.get_plex_client", return_value=plex):
+                events = list(generate_playlist_stream(
+                    genres=["Nonexistent"], decades=["1800s"], track_count=5
+                ))
+                with pytest.raises(ValueError, match="No tracks match"):
+                    generate_playlist(genres=["Nonexistent"], decades=["1800s"], track_count=5)
+
+        errors = [e for e in events if e.startswith("event: error")]
+        assert errors, events
+        payload = json.loads(errors[-1].split("data: ", 1)[1])
+        assert "No tracks match" in payload["message"]
+
+
 class TestTrackMatching:
     """Tests for track matching utilities."""
 

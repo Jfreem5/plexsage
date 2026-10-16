@@ -6,6 +6,17 @@ from unittest.mock import MagicMock
 from backend.models import Track, Dimension
 
 
+@pytest.fixture(autouse=True)
+def _isolate_global_track_cache():
+    """Clear the process-wide filter cache so tests stay order-independent."""
+    from backend.plex_client import get_track_cache
+
+    cache = get_track_cache()
+    cache.clear()
+    yield
+    cache.clear()
+
+
 @pytest.fixture
 def mock_plex_tracks() -> list[Track]:
     """Sample library tracks for testing filter/match logic."""

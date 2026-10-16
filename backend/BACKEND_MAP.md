@@ -108,9 +108,20 @@ User picks a track
       → same as above, but prompt includes seed + dimensions
 ```
 
-### 3. SSE Streaming (generator.py)
-`generate_playlist_stream()` yields events:
-`progress` (fetching → filtering → preparing → ai_working → parsing → matching → complete) or `error` or `complete`
+### 3. Generation Paths (generator.py)
+
+`generate_playlist()` (sync, `/api/generate`) and `generate_playlist_stream()`
+(SSE, `/api/generate/stream`) run the same shared stage,
+`_prepare_generation()`: fetch (a random sample when unfiltered, otherwise the
+5-minute filter cache) → mirror a Plex-served batch into `TrackDB` → size the
+budget (`compute_track_budget`) → pre-rank (`pre_rank_tracks`) → build the
+prompt. `_match_selections()` then resolves the LLM's picks. The streaming
+wrapper formats the progress events and yields them; the sync wrapper discards
+them via `_collect_preparation()`. The two paths can no longer drift.
+
+`generate_playlist_stream()` emits
+`progress` (fetching | cache_hit → pre_ranking → preparing → ai_working →
+parsing → matching → complete) or `error` or `complete`.
 
 ---
 
@@ -200,7 +211,8 @@ the seed flow behaves exactly as before.
 ## Track Matching (`generator.py`)
 
 Resolves the LLM's `{artist, title}` selections against the pre-ranked candidate
-list. `TrackMatcher` indexes the candidates **once per generation** (simplified
+list (`_match_selections()`, shared by both generation paths). `TrackMatcher`
+indexes the candidates **once per generation** (simplified
 title/artist strings, an exact-match dict, and a title-trigram inverted index),
 then resolves each selection in roughly `O(k)` instead of scanning all `n`
 tracks with `rapidfuzz`:
