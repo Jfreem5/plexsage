@@ -604,31 +604,34 @@ async def get_album_art(rating_key: str):
     if not plex_client or not plex_client.is_connected():
         raise HTTPException(status_code=503, detail="Plex not connected")
 
-    # Get track to find thumb URL
-    track = await asyncio.to_thread(plex_client.get_track_by_key, rating_key)
-    if not track:
-        raise HTTPException(status_code=404, detail="Track not found")
-
-    # Get raw thumb path from Plex
+    # Fetch the raw thumb path directly: this is a single Plex item lookup,
+    # where the previous version fetched the same item twice (once to validate,
+    # once for the thumb).
     thumb_path = await asyncio.to_thread(plex_client.get_thumb_path, rating_key)
-    if thumb_path:
-        try:
-            thumb_url = f"{config.plex.url}{thumb_path}"
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    thumb_url,
-                    headers={"X-Plex-Token": config.plex.token},
-                    timeout=10.0,
-                )
-                if response.status_code == 200:
-                    return Response(
-                        content=response.content,
-                        media_type=response.headers.get("content-type", "image/jpeg"),
-                    )
-        except Exception:
-            pass
+    if not thumb_path:
+        raise HTTPException(status_code=404, detail="Art not available")
 
-    raise HTTPException(status_code=404, detail="Art not available")
+    try:
+        thumb_url = f"{config.plex.url}{thumb_path}"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                thumb_url,
+                headers={"X-Plex-Token": config.plex.token},
+                timeout=10.0,
+            )
+    except Exception:
+        raise HTTPException(status_code=404, detail="Art not available")
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=404, detail="Art not available")
+
+    # Album art is keyed by rating key and changes very rarely, so let browsers
+    # reuse it instead of re-proxying every render.
+    return Response(
+        content=response.content,
+        media_type=response.headers.get("content-type", "image/jpeg"),
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 # =============================================================================

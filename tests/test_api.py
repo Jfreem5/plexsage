@@ -1,7 +1,7 @@
 """Tests for API endpoints."""
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 
 from backend.models import DefaultsConfig
@@ -288,3 +288,148 @@ class TestOllamaEndpoints:
                 assert response.status_code == 200
                 # Verify the custom URL was passed
                 mock_status.assert_called_once_with("http://custom-host:11434")
+
+
+class TestLibrarySyncEndpoint:
+    """Tests for the local library sync endpoint."""
+
+    def test_sync_requires_plex(self, client):
+        """POST /api/library/sync should 503 when Plex is not connected."""
+        with patch("backend.main.get_plex_client", return_value=None):
+            response = client.post("/api/library/sync")
+
+        assert response.status_code == 503
+
+    def test_sync_returns_counts(self, client):
+        """POST /api/library/sync should report synced and total track counts."""
+        mock_plex = MagicMock()
+        mock_plex.is_connected.return_value = True
+        mock_plex.sync_track_db.return_value = 5
+
+        with patch("backend.main.get_plex_client", return_value=mock_plex):
+            with patch("backend.main.get_track_db") as mock_db:
+                mock_db.return_value.get_track_count.return_value = 42
+                response = client.post("/api/library/sync?force=true")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["synced"] == 5
+        assert data["total_tracks"] == 42
+        mock_plex.sync_track_db.assert_called_once_with(True)
+
+
+class TestFilterPreviewEndpoint:
+    """POST /api/filter/preview reflects the dynamic AI track budget."""
+
+    def _post_preview(self, client, payload):
+        mock_plex = MagicMock()
+        mock_plex.is_connected.return_value = True
+        mock_plex.count_tracks_by_filters.return_value = payload.pop("_matching")
+        with patch("backend.main.get_config", return_value=create_mock_config()):
+            with patch("backend.main.get_plex_client", return_value=mock_plex):
+                return client.post("/api/filter/preview", json=payload)
+
+    def test_specific_prompt_sends_fewer_tracks(self, client):
+        response = self._post_preview(client, {
+            "_matching": 10000,
+            "genres": ["Jazz"],
+            "decades": [],
+            "track_count": 25,
+            "max_tracks_to_ai": 500,
+            "prompt": "jazz",
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert 0 < data["tracks_to_send"] < 500
+        assert data["tracks_to_send"] < data["matching_tracks"]
+
+    def test_no_signal_uses_full_ceiling(self, client):
+        from backend.generator import PRE_RANK_LIMIT
+
+        response = self._post_preview(client, {
+            "_matching": 10000,
+            "genres": [],
+            "decades": [],
+            "track_count": 25,
+            "max_tracks_to_ai": 500,
+        })
+
+        assert response.status_code == 200
+        assert response.json()["tracks_to_send"] == PRE_RANK_LIMIT
+
+    def test_pool_size_caps_tracks_to_send(self, client):
+        response = self._post_preview(client, {
+            "_matching": 40,
+            "genres": ["Jazz"],
+            "decades": [],
+            "track_count": 25,
+            "max_tracks_to_ai": 500,
+            "prompt": "jazz",
+        })
+
+        assert response.status_code == 200
+        assert response.json()["tracks_to_send"] == 40
+
+    def test_empty_library_sends_zero(self, client):
+        response = self._post_preview(client, {
+            "_matching": 0,
+            "genres": ["Jazz"],
+            "decades": [],
+            "track_count": 25,
+            "max_tracks_to_ai": 500,
+            "prompt": "jazz",
+        })
+
+        assert response.status_code == 200
+        assert response.json()["tracks_to_send"] == 0
+
+
+class TestAlbumArtEndpoint:
+    """GET /api/art/{rating_key} proxies album art from Plex."""
+
+    @staticmethod
+    def _http_client(content=b"JPEGDATA", status=200, content_type="image/jpeg"):
+        response = MagicMock()
+        response.status_code = status
+        response.content = content
+        response.headers = {"content-type": content_type}
+
+        http = MagicMock()
+        http.__aenter__ = AsyncMock(return_value=http)
+        http.__aexit__ = AsyncMock(return_value=False)
+        http.get = AsyncMock(return_value=response)
+        return http
+
+    def _get(self, client, http):
+        mock_plex = MagicMock()
+        mock_plex.is_connected.return_value = True
+        mock_plex.get_thumb_path.return_value = "/library/metadata/1/thumb/2"
+        with patch("backend.main.get_config", return_value=create_mock_config()):
+            with patch("backend.main.get_plex_client", return_value=mock_plex):
+                with patch("backend.main.httpx.AsyncClient", return_value=http):
+                    response = client.get("/api/art/123")
+        return response, mock_plex
+
+    def test_art_is_fetched_with_one_item_lookup(self, client):
+        response, mock_plex = self._get(client, self._http_client())
+
+        assert response.status_code == 200
+        assert response.content == b"JPEGDATA"
+        # A single Plex item lookup, not the old validate-then-thumb double fetch.
+        mock_plex.get_thumb_path.assert_called_once_with("123")
+        mock_plex.get_track_by_key.assert_not_called()
+
+    def test_art_is_cacheable(self, client):
+        response, _ = self._get(client, self._http_client())
+        assert "max-age" in response.headers.get("cache-control", "")
+
+    def test_missing_thumb_returns_404(self, client):
+        mock_plex = MagicMock()
+        mock_plex.is_connected.return_value = True
+        mock_plex.get_thumb_path.return_value = None
+        with patch("backend.main.get_config", return_value=create_mock_config()):
+            with patch("backend.main.get_plex_client", return_value=mock_plex):
+                response = client.get("/api/art/123")
+
+        assert response.status_code == 404
