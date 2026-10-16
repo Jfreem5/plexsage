@@ -4,6 +4,7 @@ import hashlib
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from plexapi.exceptions import NotFound, Unauthorized
@@ -12,8 +13,21 @@ from requests.exceptions import ConnectionError, Timeout
 from unidecode import unidecode
 
 from backend.models import Track
+from backend.track_db import SYNC_INTERVAL_SECONDS, get_track_db
 
 logger = logging.getLogger(__name__)
+
+
+def _epoch_to_iso(timestamp: Any) -> str | None:
+    """Convert a Plex epoch timestamp (seconds) to an ISO-8601 UTC string."""
+    if not timestamp:
+        return None
+    try:
+        return datetime.fromtimestamp(int(timestamp), tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
 
 
 class TrackCache:
@@ -223,6 +237,91 @@ class PlexClient:
         """Get the last error message if any."""
         return self._error
 
+    # ------------------------------------------------------------------
+    # Local track database
+    # ------------------------------------------------------------------
+
+    def _get_track_db(self):
+        """Return the global TrackDB if it has been populated, else None.
+
+        Used to decide whether a query can be served locally instead of over
+        the Plex HTTP API.
+        """
+        db = get_track_db()
+        if db is None:
+            return None
+        try:
+            if db.is_empty():
+                return None
+        except Exception:
+            logger.exception("TrackDB unavailable; falling back to Plex API")
+            return None
+        return db
+
+    def sync_track_db(
+        self,
+        force: bool = False,
+        max_age_seconds: int = SYNC_INTERVAL_SECONDS,
+    ) -> int:
+        """Mirror the entire Plex music library into the local TrackDB.
+
+        Fetches every track once (ratings, play counts, last-played, live
+        detection) and upserts it. Removed tracks are pruned so the DB stays a
+        faithful mirror.
+
+        Args:
+            force: Sync even if the DB is still fresh.
+            max_age_seconds: Freshness window before a sync is triggered.
+
+        Returns:
+            Number of tracks synced, or 0 if skipped/unavailable.
+        """
+        db = get_track_db()
+        if db is None or not self.is_connected():
+            return 0
+
+        if not force and not db.needs_sync(max_age_seconds):
+            logger.debug("TrackDB is fresh; skipping sync")
+            return 0
+
+        try:
+            plex_tracks = self._library.search(libtype="track")
+        except Exception as exc:
+            logger.exception("Failed to fetch tracks for TrackDB sync: %s", exc)
+            return 0
+
+        tracks: list[Track] = []
+        is_live_flags: list[bool] = []
+        ratings: list[int] = []
+        plays: list[int] = []
+        last_played: list[str | None] = []
+
+        for plex_track in plex_tracks:
+            tracks.append(self._convert_track(plex_track))
+            is_live_flags.append(is_live_version(plex_track))
+            ratings.append(int(getattr(plex_track, "userRating", 0) or 0))
+            plays.append(int(getattr(plex_track, "viewCount", 0) or 0))
+            last_played.append(_epoch_to_iso(getattr(plex_track, "lastViewedAt", None)))
+
+        count = db.upsert_tracks(
+            tracks,
+            is_live_flags=is_live_flags,
+            user_ratings=ratings,
+            play_counts=plays,
+            last_played=last_played,
+        )
+        db.prune_except(t.rating_key for t in tracks)
+        db.set_last_sync()
+        logger.info("TrackDB sync complete: %d tracks", count)
+        return count
+
+    def ensure_synced(self, max_age_seconds: int = SYNC_INTERVAL_SECONDS) -> int:
+        """Sync the DB if it is empty or stale. Safe to call frequently."""
+        db = get_track_db()
+        if db is None or not db.needs_sync(max_age_seconds):
+            return 0
+        return self.sync_track_db(max_age_seconds=max_age_seconds)
+
     def get_music_libraries(self) -> list[str]:
         """Get list of music library names."""
         if not self._server:
@@ -237,9 +336,19 @@ class PlexClient:
     def get_library_stats(self) -> dict[str, Any]:
         """Get statistics about the music library.
 
+        Served from the local TrackDB when it has been synced (with genre and
+        decade counts), otherwise computed from the Plex API.
+
         Returns:
             Dict with total_tracks, genres, and decades
         """
+        db = self._get_track_db()
+        if db is not None:
+            try:
+                return db.get_library_stats()
+            except Exception:
+                logger.exception("TrackDB stats failed; falling back to Plex API")
+
         if not self._library:
             return {"total_tracks": 0, "genres": [], "decades": []}
 
@@ -308,6 +417,18 @@ class PlexClient:
         Returns:
             List of matching Track objects
         """
+        db = self._get_track_db()
+        if db is not None:
+            try:
+                return db.get_tracks_by_filters(
+                    genres=genres,
+                    decades=decades,
+                    exclude_live=exclude_live,
+                    min_rating=min_rating,
+                )
+            except Exception:
+                logger.exception("TrackDB filter query failed; falling back to Plex API")
+
         if not self._library:
             return []
 
@@ -317,11 +438,17 @@ class PlexClient:
             # Fetch tracks with server-side filters
             plex_tracks = self._library.search(libtype="track", **filters)
 
-            # Post-filter for live versions (can't be done server-side)
-            if exclude_live:
-                plex_tracks = [t for t in plex_tracks if not is_live_version(t)]
-
-            return [self._convert_track(t) for t in plex_tracks]
+            # Live detection is computed exactly once per track here; the flag
+            # then travels with the Track instead of being recomputed later.
+            tracks: list[Track] = []
+            for plex_track in plex_tracks:
+                is_live = is_live_version(plex_track)
+                if exclude_live and is_live:
+                    continue
+                track = self._convert_track(plex_track)
+                track.is_live = is_live
+                tracks.append(track)
+            return tracks
         except Exception as e:
             logger.exception("Failed to query Plex library with filters: %s", filters)
             raise PlexQueryError(f"Failed to query Plex library: {e}") from e
@@ -378,6 +505,18 @@ class PlexClient:
         Returns:
             Count of matching tracks, or -1 on error
         """
+        db = self._get_track_db()
+        if db is not None:
+            try:
+                return db.count_tracks_by_filters(
+                    genres=genres,
+                    decades=decades,
+                    exclude_live=exclude_live,
+                    min_rating=min_rating,
+                )
+            except Exception:
+                logger.exception("TrackDB count failed; falling back to Plex API")
+
         if not self._library:
             return -1
 
@@ -464,6 +603,13 @@ class PlexClient:
         Returns:
             List of random Track objects
         """
+        db = self._get_track_db()
+        if db is not None:
+            try:
+                return db.get_random_tracks(count=count, exclude_live=exclude_live)
+            except Exception:
+                logger.exception("TrackDB random query failed; falling back to Plex API")
+
         if not self._library:
             return []
 
@@ -477,10 +623,16 @@ class PlexClient:
                 limit=fetch_count,
             )
 
-            if exclude_live:
-                plex_tracks = [t for t in plex_tracks if not is_live_version(t)]
-
-            tracks = [self._convert_track(t) for t in plex_tracks[:count]]
+            tracks: list[Track] = []
+            for plex_track in plex_tracks:
+                is_live = is_live_version(plex_track)
+                if exclude_live and is_live:
+                    continue
+                track = self._convert_track(plex_track)
+                track.is_live = is_live
+                tracks.append(track)
+                if len(tracks) >= count:
+                    break
             return tracks
         except Exception as e:
             logger.exception("Failed to get random tracks: %s", e)
@@ -496,6 +648,13 @@ class PlexClient:
         Returns:
             List of matching Track objects
         """
+        db = self._get_track_db()
+        if db is not None:
+            try:
+                return db.search_tracks(query, limit=limit)
+            except Exception:
+                logger.exception("TrackDB search failed; falling back to Plex API")
+
         if not self._library:
             return []
 

@@ -90,7 +90,25 @@ async def lifespan(app: FastAPI):
     if config.llm.api_key or config.llm.provider in ("ollama", "custom"):
         init_llm_client(config.llm)
 
-    yield
+    # Initialize TrackDB so library queries and pre-ranking can run locally
+    init_track_db()
+
+    # Mirror the Plex library into the DB in the background (initial sync +
+    # periodic refresh). Requests fall back to the Plex API until it's ready.
+    sync_task = None
+    if get_plex_client() is not None:
+        sync_task = asyncio.create_task(_periodic_track_db_sync())
+
+    try:
+        yield
+    finally:
+        if sync_task is not None:
+            sync_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sync_task
+        db = get_track_db()
+        if db:
+            db.close()
 
 
 app = FastAPI(
@@ -322,6 +340,26 @@ async def search_library(q: str = Query(..., description="Search query")) -> lis
         raise HTTPException(status_code=503, detail="Plex not connected")
 
     return await asyncio.to_thread(plex_client.search_tracks, q)
+
+
+@app.post("/api/library/sync")
+async def sync_library(force: bool = Query(False, description="Force a full re-sync")) -> dict:
+    """Mirror the Plex library into the local SQLite track database.
+
+    Normally runs automatically on startup and every 30 minutes; this endpoint
+    lets the UI trigger (or force) a sync on demand.
+    """
+    plex_client = get_plex_client()
+    if not plex_client or not plex_client.is_connected():
+        raise HTTPException(status_code=503, detail="Plex not connected")
+
+    synced = await asyncio.to_thread(plex_client.sync_track_db, force)
+
+    db = get_track_db()
+    return {
+        "synced": synced,
+        "total_tracks": db.get_track_count() if db else 0,
+    }
 
 
 # =============================================================================
