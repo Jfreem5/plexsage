@@ -67,6 +67,11 @@ config.user.yaml
 *.log
 logs/
 
+# Local SQLite track database
+*.db
+*.db-wal
+*.db-shm
+
 # Docker
 .docker/
 

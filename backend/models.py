@@ -20,6 +20,7 @@ class Track(BaseModel):
     duration_ms: int
     year: int | None = None
     genres: list[str] = []
+    is_live: bool | None = None
     art_url: str | None = None
 
     @property
