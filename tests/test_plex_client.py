@@ -3,6 +3,8 @@
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from backend.models import Track
 from backend.plex_client import TrackCache, is_live_version
 
@@ -646,3 +648,112 @@ class TestPlexClientTrackDB:
         assert db.get_track_count() == 1
         assert db.get_metadata("2") is None
 
+
+class TestSyncPagination:
+    """A full sync streams the library in pages instead of buffering it."""
+
+    def _client(self):
+        from backend.plex_client import PlexClient
+
+        mock_library = MagicMock()
+        mock_server = MagicMock()
+        mock_server.library.section.return_value = mock_library
+        with patch("backend.plex_client.PlexServer", return_value=mock_server):
+            client = PlexClient("http://localhost:32400", "token", "Music")
+        return client, mock_library
+
+    def _library(self, total):
+        """A fake Plex library that serves tracks in container-sized slices."""
+        tracks = [
+            _make_plex_track(rating_key=str(i), title=f"Track {i}") for i in range(total)
+        ]
+        calls = []
+
+        def search(libtype=None, container_start=0, container_size=None, maxresults=None, **kw):
+            calls.append((container_start, container_size, maxresults))
+            size = maxresults or container_size or 0
+            return tracks[container_start:container_start + size]
+
+        return search, calls
+
+    def _make_db(self, tmp_path):
+        from backend.track_db import TrackDB
+
+        return TrackDB(tmp_path / "plex.db")
+
+    @pytest.mark.parametrize(
+        "total,expected_batches",
+        [
+            (1200, [500, 500, 200]),  # trailing short page ends the walk
+            (1000, [500, 500]),       # exact multiple needs one empty page
+            (0, []),                  # empty library: no pages written
+        ],
+    )
+    def test_sync_writes_one_page_at_a_time(self, tmp_path, total, expected_batches):
+        """Each page is upserted as it arrives, not accumulated."""
+        client, mock_library = self._client()
+        mock_library.search.side_effect, calls = self._library(total)
+        db = self._make_db(tmp_path)
+
+        batches = []
+        real_upsert = db.upsert_tracks
+
+        def spy_upsert(tracks, **kwargs):
+            batches.append(len(tracks))
+            return real_upsert(tracks, **kwargs)
+
+        with patch.object(db, "upsert_tracks", side_effect=spy_upsert):
+            with patch("backend.plex_client.get_track_db", return_value=db):
+                count = client.sync_track_db(force=True)
+
+        assert count == total
+        assert db.get_track_count() == total
+        assert batches == expected_batches
+        # Every request asked for exactly one container-sized page.
+        assert all(size == 500 and maxresults == 500 for _, size, maxresults in calls)
+
+    def test_sync_page_size_is_configurable(self, tmp_path):
+        """page_size drives container_start/container_size and the batch split."""
+        client, mock_library = self._client()
+        mock_library.search.side_effect, calls = self._library(5)
+        db = self._make_db(tmp_path)
+
+        with patch("backend.plex_client.get_track_db", return_value=db):
+            count = client.sync_track_db(force=True, page_size=2)
+
+        assert count == 5
+        assert [start for start, _, _ in calls] == [0, 2, 4]
+        assert all(size == 2 and maxresults == 2 for _, size, maxresults in calls)
+
+    def test_sync_rejects_nonpositive_page_size(self, tmp_path):
+        client, mock_library = self._client()
+        db = self._make_db(tmp_path)
+
+        with patch("backend.plex_client.get_track_db", return_value=db):
+            with pytest.raises(ValueError):
+                client.sync_track_db(force=True, page_size=0)
+
+        mock_library.search.assert_not_called()
+
+    def test_sync_failure_mid_way_does_not_mark_synced(self, tmp_path):
+        """A failed page returns 0 and leaves the sync retryable, not half-marked."""
+        client, mock_library = self._client()
+        db = self._make_db(tmp_path)
+
+        first_page = [_make_plex_track(rating_key=str(i)) for i in range(500)]
+        calls = []
+
+        def search(libtype=None, container_start=0, container_size=None, maxresults=None, **kw):
+            calls.append(container_start)
+            if container_start == 0:
+                return first_page
+            raise ConnectionError("plex went away")
+
+        mock_library.search.side_effect = search
+
+        with patch("backend.plex_client.get_track_db", return_value=db):
+            assert client.sync_track_db(force=True) == 0
+
+        # Page one landed, but the sync is not marked fresh so it is retried.
+        assert calls == [0, 500]
+        assert db.get_last_sync() is None

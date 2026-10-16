@@ -250,7 +250,7 @@ pre-rank ordering used for deterministic tie-breaking.
 | `get_track_by_key()` | Single track by ratingKey |
 | `get_thumb_path()` | Raw thumb path for art proxy |
 | `create_playlist()` | Create playlist, returns URL + counts |
-| `sync_track_db()` | Mirror the whole library into `TrackDB` (ratings, plays, live flags) |
+| `sync_track_db()` | Mirror the whole library into `TrackDB` page by page (ratings, plays, live flags) |
 | `ensure_synced()` | Sync only if the DB is empty or stale |
 | `_get_track_db()` | Return the populated TrackDB, or None to use the API |
 | `_convert_track()` | Plex object → `Track` model |
@@ -268,9 +268,12 @@ pre-rank ordering used for deterministic tie-breaking.
   erroring DB → transparent fallback to the Plex API. `PlexClient.db_available()`
   exposes the same gate so the generator can tell whether a read was served
   locally and skip a redundant mirror (`sync_from_plex`) of rows already stored.
-- **Sync:** `PlexClient.sync_track_db()` fetches every track once (rating,
-  play count, last-played, live flag) and prunes removed tracks. The app runs it
-  on startup and every `SYNC_INTERVAL_SECONDS` (30 min) via a background task in
+- **Sync:** `PlexClient.sync_track_db()` walks the library one page
+  (`SYNC_PAGE_SIZE` = 500) at a time via `container_start`/`container_size`
+  (+`maxresults`, so plexapi returns a single page per request) and upserts each
+  page as it arrives; only the in-flight page is built in memory, not the whole
+  library. Removed tracks are pruned once the walk finishes. The app runs it on
+  startup and every `SYNC_INTERVAL_SECONDS` (30 min) via a background task in
   the `main.py` lifespan; `POST /api/library/sync` triggers it on demand.
 - **Threading:** every thread (including each `asyncio.to_thread` worker) gets
   its own connection from `_get_conn()`. With WAL, readers run concurrently and

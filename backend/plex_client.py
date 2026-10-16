@@ -5,7 +5,7 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterator
 
 from plexapi.exceptions import NotFound, Unauthorized
 from plexapi.server import PlexServer
@@ -16,6 +16,11 @@ from backend.models import Track
 from backend.track_db import SYNC_INTERVAL_SECONDS, get_track_db
 
 logger = logging.getLogger(__name__)
+
+# Plex tracks requested (and written) per page while mirroring the library.
+# A full sync streams pages straight into the DB instead of materialising the
+# whole library in memory.
+SYNC_PAGE_SIZE = 500
 
 
 def _epoch_to_iso(timestamp: Any) -> str | None:
@@ -267,24 +272,56 @@ class PlexClient:
         """
         return self._get_track_db() is not None
 
+    def _iter_library_tracks(self, page_size: int) -> Iterator[list[Any]]:
+        """Yield the library one bounded page of Plex tracks at a time.
+
+        ``plexapi`` normally walks every page inside a single ``search`` call;
+        passing ``maxresults`` caps it to one page per request (see
+        ``PlexObject.fetchItems``), so peak memory stays proportional to
+        *page_size* instead of the size of the library.
+        """
+        start = 0
+        while True:
+            page = self._library.search(
+                libtype="track",
+                container_start=start,
+                container_size=page_size,
+                maxresults=page_size,
+            )
+            if not page:
+                return
+            yield page
+            if len(page) < page_size:
+                return
+            start += page_size
+
     def sync_track_db(
         self,
         force: bool = False,
         max_age_seconds: int = SYNC_INTERVAL_SECONDS,
+        page_size: int = SYNC_PAGE_SIZE,
     ) -> int:
         """Mirror the entire Plex music library into the local TrackDB.
 
-        Fetches every track once (ratings, play counts, last-played, live
-        detection) and upserts it. Removed tracks are pruned so the DB stays a
+        Walks the library one page at a time (ratings, play counts,
+        last-played, live detection) and upserts each page as it arrives, so
+        peak memory tracks *page_size* rather than the size of the library.
+        Removed tracks are pruned once the walk completes so the DB stays a
         faithful mirror.
 
         Args:
             force: Sync even if the DB is still fresh.
             max_age_seconds: Freshness window before a sync is triggered.
+            page_size: Tracks fetched and written per page.
 
         Returns:
-            Number of tracks synced, or 0 if skipped/unavailable.
+            Number of tracks synced, or 0 if skipped/unavailable. A fetch that
+            fails part-way leaves the pages already written in place but does
+            not mark the sync complete, so the next call retries it.
         """
+        if page_size < 1:
+            raise ValueError("page_size must be at least 1")
+
         db = get_track_db()
         if db is None or not self.is_connected():
             return 0
@@ -293,33 +330,36 @@ class PlexClient:
             logger.debug("TrackDB is fresh; skipping sync")
             return 0
 
+        count = 0
+        synced_keys: set[str] = set()
         try:
-            plex_tracks = self._library.search(libtype="track")
+            for page in self._iter_library_tracks(page_size):
+                tracks: list[Track] = []
+                is_live_flags: list[bool] = []
+                ratings: list[int] = []
+                plays: list[int] = []
+                last_played: list[str | None] = []
+
+                for plex_track in page:
+                    tracks.append(self._convert_track(plex_track))
+                    is_live_flags.append(is_live_version(plex_track))
+                    ratings.append(int(getattr(plex_track, "userRating", 0) or 0))
+                    plays.append(int(getattr(plex_track, "viewCount", 0) or 0))
+                    last_played.append(_epoch_to_iso(getattr(plex_track, "lastViewedAt", None)))
+
+                count += db.upsert_tracks(
+                    tracks,
+                    is_live_flags=is_live_flags,
+                    user_ratings=ratings,
+                    play_counts=plays,
+                    last_played=last_played,
+                )
+                synced_keys.update(t.rating_key for t in tracks)
         except Exception as exc:
             logger.exception("Failed to fetch tracks for TrackDB sync: %s", exc)
             return 0
 
-        tracks: list[Track] = []
-        is_live_flags: list[bool] = []
-        ratings: list[int] = []
-        plays: list[int] = []
-        last_played: list[str | None] = []
-
-        for plex_track in plex_tracks:
-            tracks.append(self._convert_track(plex_track))
-            is_live_flags.append(is_live_version(plex_track))
-            ratings.append(int(getattr(plex_track, "userRating", 0) or 0))
-            plays.append(int(getattr(plex_track, "viewCount", 0) or 0))
-            last_played.append(_epoch_to_iso(getattr(plex_track, "lastViewedAt", None)))
-
-        count = db.upsert_tracks(
-            tracks,
-            is_live_flags=is_live_flags,
-            user_ratings=ratings,
-            play_counts=plays,
-            last_played=last_played,
-        )
-        db.prune_except(t.rating_key for t in tracks)
+        db.prune_except(synced_keys)
         db.set_last_sync()
         logger.info("TrackDB sync complete: %d tracks", count)
         return count
