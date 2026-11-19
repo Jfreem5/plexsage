@@ -28,3 +28,33 @@ llm:
 defaults:
   # Default number of tracks in generated playlists (15, 25, or 40)
   track_count: 25
+
+external:
+  # Optional third-party datasources (parquet / CSV / JSONL) whose facts enrich both
+  # track filtering and the LLM prompts. Leave sources empty to keep the old behavior.
+  # Each source is one file or a directory of files; facts join the library on
+  # normalized song/album/artist keys, so nothing here is dataset-specific.
+  # Override this whole section without editing the file: EXTERNAL_SOURCES as JSON,
+  # e.g. EXTERNAL_SOURCES='[{"path": "/path/to/enriched"}]'
+  sources: []
+  # sources:
+  #   - path: "/path/to/enriched_songs.parquet"  # file, or a directory of them
+  #     # level: ""            # song | album | artist; empty infers it from the columns
+  #     # name: ""             # status label; defaults to the file stem
+  #     # key_columns: []      # columns already holding the join key
+  #     # only_fields: []      # keep only these columns (empty = keep all)
+  #     # drop_fields: []      # columns never to read
+  #     # max_rows: 0          # 0 = read the whole file
+  max_facts_per_track: 8  # Facts written into one prompt line (0 turns enrichment off)
+  max_tracks_with_facts: 400  # Cap so a big candidate list stays bounded
+
+spotify:
+  # Optional Spotify playlist import. Two paths, picked by what you fill in:
+  # a Spotify for Developers app pair fetches fresh rows from api.spotify.com,
+  # otherwise parquet_dir resolves the playlist from a local Annas/Spotify dump
+  # (needs duckdb installed). Configure neither and only the import routes answer,
+  # with an error naming both remedies; every other route is unaffected.
+  # Env overrides, one by one: SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_PARQUET_DIR
+  client_id: ""
+  client_secret: ""
+  parquet_dir: ""  # directory holding playlists/ playlist_tracks/ tracks/ albums/ parts

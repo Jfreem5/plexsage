@@ -110,6 +110,9 @@ Before the AI sees anything, you control the pool:
 
 Real-time track counts show exactly how your filters narrow results.
 
+Optional third-party datasources add facts Plex does not carry ("most streamed", "sampled heavily",
+"on a major label") to both the pool and the AI prompt — see [External Datasources](#external-datasources).
+
 ### Local Library Cache
 
 MediaSage syncs your Plex library to a local SQLite database. After a one-time sync (~2 min for 18,000 tracks), all library operations—filtering, counting, sending to AI—happen locally in milliseconds instead of waiting on Plex.
@@ -141,12 +144,28 @@ Estimated cost displays before you generate. MediaSage auto-detects your provide
 
 - **Play Now** — send tracks directly to any Plex device for instant playback
 - **Create** a new playlist, **replace** an existing one, or **append** tracks to one
+- **Playlist for** — save into another Plex account on your server: create it *as* that
+  user (they own and manage it) or keep it as yours and put a separate copy in their library
+- The playlist picker and replace/append actions follow the same selected account
 - Device picker shows all active Plex clients with status indicators
 - Duplicate detection when appending to existing playlists
 - Preview tracks with album art before saving
 - Remove tracks you don't want
 - Rename the playlist
 - See actual token usage and cost
+
+### Import Spotify Playlists
+
+Keep a playlist on Spotify? Bring it across as a Plex playlist of the songs your library can play:
+
+- **Paste the URL** — Spotify playlist URL, `spotify:playlist:` URI or bare id
+- **Fresh rows** — api.spotify.com when you configure a Spotify for Developers app pair; otherwise
+  resolve the playlist from a local Annas/Spotify parquet dump
+- **Matched songs** — each says how it landed: exact song, another version of it, or the same
+  title/album under a different artist credit
+- **Missing songs are kept** — written to the cache's `missing_songs` wish list, so you can go get
+  them later; re-importing refreshes rather than stacks that list
+- See [Spotify Playlist Import](#spotify-playlist-import) under Configuration for the setup
 
 ---
 
@@ -324,6 +343,10 @@ sudo systemctl start mediasage
 | `CUSTOM_LLM_URL` | No | Custom OpenAI-compatible API base URL |
 | `CUSTOM_LLM_API_KEY` | No | API key for custom provider (if required) |
 | `CUSTOM_CONTEXT_WINDOW` | No | Context window size for custom provider (default: 32768) |
+| `EXTERNAL_SOURCES` | No | Optional third-party datasources, as JSON (see [External datasources](#external-datasources)) |
+| `SPOTIFY_CLIENT_ID` | No | Spotify for Developers app id — import fetches fresh playlist rows |
+| `SPOTIFY_CLIENT_SECRET` | No | Its secret; set both to use the Spotify API path |
+| `SPOTIFY_PARQUET_DIR` | No | Or import from a local Annas/Spotify parquet dump (one directory per table) |
 
 ### Web UI Configuration
 
@@ -346,6 +369,121 @@ llm:
 defaults:
   track_count: 25
 ```
+
+### External Datasources
+
+Third-party tables — a parquet or CSV dump such as the Annas/Spotify enrichment a
+companion checkout keeps beside its own library — can add facts the Plex library itself does
+not carry ("most streamed", "sampled heavily", "signed to a major label"). They are optional:
+with no source configured, filtering and prompts behave exactly as before, and no extra
+dependency is required (parquet is read with whichever of pyarrow, pandas, polars or duckdb the
+environment already has, and a stdlib CSV/JSONL reader otherwise).
+
+```yaml
+external:
+  sources:
+    - path: "/path/to/enriched" # one file, or a directory of them
+      # level: "" # song | album | artist; empty infers it from the columns
+      # key_columns: [] # columns already holding the join key
+      # only_fields: [] # keep only these columns (empty = keep all)
+      # drop_fields: [] # columns never to read
+      # max_rows: 0 # 0 = read the whole file
+  max_facts_per_track: 8 # facts written into one prompt line (0 turns that off)
+  max_tracks_with_facts: 400
+```
+
+A file only has to follow the shape it already has: **one entity per row** (song, album or
+artist), **the row carries its join key** — either in a column you name, or built from the
+title/album/artist columns normalized the same way the library's own search does — and **every
+other column is a fact**. Numbers filter with bounds, text filters by equality, arrays filter
+by membership. Nothing is dataset-specific, so a column you add is filterable and prompt-
+readable after the next refresh without any code change.
+
+Keep the files outside the repo, or in `data/external/` — that path (plus `*.parquet`, `*.jsonl`)
+is gitignored, since a datasource is your data, not this project's.
+
+To **build** one from your own library and a Spotify parquet dump, `scripts/enrich_from_parquet.py`
+runs the sibling checkout's DuckDB query over the dump — filtered by `data/library_cache.db`'s
+`tracks` table — and then makes the same refresh the `POST /api/external/refresh` route makes, so
+the facts are filterable and prompt-readable the moment the command exits:
+
+```bash
+uv run --with-requirements requirements.in scripts/enrich_from_parquet.py --check
+uv run --with-requirements requirements.in scripts/enrich_from_parquet.py
+```
+
+`--check` writes nothing and prints what the cache holds, what the config names, when the last
+merge ran and whether the dump's bytes can be opened. `--if-stale` re-merges only when the last
+Plex sync is newer than that output — a re-sync adds tracks the merge never saw — and `--refresh-only`
+re-ingests the files already on disk. `--with-playlist` opts the merge back in to reading the dump's
+`playlist_tracks` table (default off, and `playlist_hit_count` then stays "not measured" rather than
+0). Run it from a terminal or the notebook kernel when the dump sits on a network mount: a sandboxed
+agent shell may be denied that path, and the script says so instead of reporting an empty dump.
+
+The facts are stored beside the Plex tracks in the same SQLite cache when you re-read the files
+(`POST /api/external/refresh`, which also keys the library's own rows), so they survive a library
+re-sync and stay valid for another server's copy of the same music. Check what was read with
+`GET /api/external/status` (rows, how many joined the library, and the catalogue of
+filterable facts with the operators each accepts).
+
+Requests then constrain those facts through `external_filters`, the sibling of the library's own
+filters on `POST /api/filter/preview` and `POST /api/generate/stream`:
+
+```json
+{
+  "genres": ["Rock"],
+  "external_filters": [
+    {"field": "popularity", "op": "min", "numbers": [1000]},
+    {"field": "labels", "op": "has", "texts": ["XL Recordings"]},
+    {"field": "mood", "op": "none_of", "texts": ["aggressive"]}
+  ]
+}
+```
+
+A fact a datasource never mentions is not excluded by default — a ban keeps the tracks the
+source says nothing about, while a want requires evidence — and `keep_unknown: false` opts into
+"only rows the datasource covers". `POST /api/analyze/prompt` publishes the catalogue as
+`available_external_fields` and may answer a request the library's columns cannot with
+`suggested_external_filters` to send back as `external_filters`.
+
+### Spotify Playlist Import
+
+A Spotify playlist you already keep can become a Plex playlist of the songs your library can
+actually play, and everything it cannot play becomes a stored **wish list** you can act on later.
+It is optional in the same way datasources are: an install that configures neither path keeps
+every other route working, and the import routes answer with an error naming both remedies.
+
+```yaml
+spotify:
+  # Free app pair from developer.spotify.com — fresh rows, any public playlist
+  client_id: ""
+  client_secret: ""
+  # Or resolve the playlist from a local Annas/Spotify parquet dump instead
+  # (needs duckdb installed; only playlists that snapshot captured resolve)
+  parquet_dir: ""
+```
+
+Env equivalents: `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_PARQUET_DIR`. Credentials
+win when both are configured, since they are the only path that sees the playlist as it is now.
+
+Then `POST /api/import/spotify/preview` asks what would match without writing anything — each
+matched row carries a `match_kind` saying how it landed: `exact` (same normalized song), `version`
+(the same title and artist on another album), `album` (the same title and album under another
+artist credit), or `search` when only live Plex search could answer. Where two library copies exist,
+the one whose duration sits closest to Spotify's wins, so a deluxe-edition twin loses.
+
+`POST /api/import/spotify` writes the Plex playlist (same `user` / `copy_to` keys as `/api/playlist`),
+saves a `spotify_import` history row and records the misses in the cache's `missing_songs` table:
+
+```json
+{"playlist_ref": "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"}
+```
+
+Re-importing replaces that playlist's wish rows rather than stacking them, so a playlist that is
+now fully matched clears its old wish; other playlists' wishes stay intact. Nothing matched is not
+an error — you get `success: false` with the wish list written and no empty Plex playlist.
+Read the wish list back with `GET /api/import/spotify/missing?limit=&offset=`, which pages the rows
+and summarizes each playlist that imported.
 
 ### Model Selection
 
@@ -460,6 +598,21 @@ uvicorn backend.main:app --reload --port 5765
 pytest tests/ -v
 ```
 
+### Manual Backend Notebook
+
+`notebooks/manual_backend.ipynb` runs the backend pipeline by hand — it calls
+the same functions as the HTTP routes, with editable cells for Plex/LLM config,
+library sync, prompt analysis, filter preview, streaming generation, seed-track
+analysis, and saving playlists to Plex. Handy for debugging without the web UI.
+
+```bash
+pip install jupyter        # pandas optional, for the results table
+jupyter lab notebooks/manual_backend.ipynb
+```
+
+Run cells top-down and edit the values in the **Configuration** cells. Values
+default from `.env`, so nothing secret is stored in the notebook.
+
 ### Tech Stack
 
 - **Backend:** Python 3.11+, FastAPI, python-plexapi, rapidfuzz, httpx
@@ -472,6 +625,10 @@ pytest tests/ -v
 ## API Reference
 
 Interactive documentation available at `/docs` when running.
+
+`INTERFACES.md` (repo root) is the full contract surface — every route with its request/response
+models, the module-level Python API, the SQLite schema, the frontend surface and the config chain —
+written so an agent can work against the repo without opening the sources.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -490,7 +647,7 @@ Interactive documentation available at `/docs` when running.
 | `/api/filter/preview` | POST | Preview filtered track list |
 | `/api/generate` | POST | Generate playlist |
 | `/api/generate/stream` | POST | Stream playlist generation (SSE) |
-| `/api/playlist` | POST | Save playlist to Plex |
+| `/api/playlist` | POST | Save playlist to Plex (optionally for another user) |
 | `/api/playlist/update` | POST | Replace or append to a playlist |
 | `/api/recommend/albums/preview` | GET | Preview album candidates for filters |
 | `/api/recommend/analyze-prompt` | POST | Analyze prompt for genre/decade filters |
@@ -500,12 +657,35 @@ Interactive documentation available at `/docs` when running.
 | `/api/results` | GET | List saved result history |
 | `/api/results/{id}` | GET/DELETE | Get or delete a saved result |
 | `/api/plex/clients` | GET | List active Plex clients |
-| `/api/plex/playlists` | GET | List existing Plex playlists |
+| `/api/plex/playlists` | GET | List playlists for a Plex user (`?user=`) |
+| `/api/plex/users` | GET | List Plex accounts that can own playlists |
 | `/api/play-queue` | POST | Send tracks to a Plex client |
+| `/api/external/status` | GET | External datasource state: rows read, joins, filterable facts |
+| `/api/external/refresh` | POST | Re-read the configured datasources into the cache |
+| `/api/import/spotify/preview` | POST | Match a Spotify playlist against the library, write nothing |
+| `/api/import/spotify` | POST | Import a Spotify playlist as a Plex playlist (+ wish list of misses) |
+| `/api/import/spotify/missing` | GET | The stored wish list: songs imported playlists asked for but lack |
 | `/api/art/{rating_key}` | GET | Proxy album art from Plex |
 | `/api/ollama/status` | GET | Ollama connection status |
 | `/api/ollama/models` | GET | List available Ollama models |
 | `/api/ollama/model-info` | GET | Get model details (context window) |
+
+### Saving Playlists for Another Plex User
+
+`GET /api/plex/users` lists the Plex accounts that can own a playlist on your server —
+the connected account first (key `__owner__`), then everyone shared into it. Pass that key
+to the playlist endpoints:
+
+| Field | Endpoints | Meaning |
+|---|---|---|
+| `user` | `/api/playlist`, `/api/playlist/update`, `/api/plex/playlists` | Which account owns the playlist (`__owner__` = the account `PLEX_TOKEN` belongs to) |
+| `copy_to` | `/api/playlist` | Extra accounts that each get their own copy in their own library |
+
+Writing as another user requires that server to be shared with them: MediaSage connects
+as them (admin-only `switchUser`), so the playlist lands in their library owned by them.
+Plex has no server-side user-to-user playlist share, so `copy_to` creates a separate copy
+per account and skips tracks that account cannot see. Replace and append stay inside the
+one selected account, and the response's `owner` and `copies` fields report who got what.
 
 ---
 

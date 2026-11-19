@@ -30,6 +30,7 @@
                     </div>
                 </div>
                 <button class="nav-btn" data-nav="recommend-album" aria-current="false">Recommend Album</button>
+                <button class="nav-btn" data-nav="import-spotify" aria-current="false">Import Spotify</button>
                 <button class="nav-btn nav-btn--icon" data-nav="settings" aria-current="false" aria-label="Settings"><svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
             </nav>
         </header>
@@ -210,6 +211,13 @@
                                 <div class="home-card-desc">Find the perfect album for the moment</div>
                             </div>
                         </button>
+                        <button class="home-card" data-nav="import-spotify">
+                            <div class="home-card-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V15"/><path d="m7 3 5 5 5-5"/><path d="M12 3v10"/></svg></div>
+                            <div class="home-card-text">
+                                <div class="home-card-title">Import Spotify Playlist</div>
+                                <div class="home-card-desc">Bring a Spotify list across as one you own</div>
+                            </div>
+                        </button>
                     </div>
                     <div class="home-history">
                         <h3 class="home-history-header">Recent activity</h3>
@@ -379,6 +387,14 @@
                         </div>
 
                         <div class="filter-section">
+                            <h3>Rated By</h3>
+                            <p class="filter-hint">Whose star ratings the filters read. Tracks they never rated fall back to the main account's.</p>
+                            <select id="rating-user-select" class="rating-user-select" aria-label="Plex account whose ratings are used">
+                                <option value="__owner__">Main account</option>
+                            </select>
+                        </div>
+
+                        <div class="filter-section">
                             <h3>Max Tracks to AI</h3>
                             <p class="filter-hint">Limit how many tracks are sent to the AI for selection. Higher = better variety but more cost.</p>
                             <div class="track-limit-selector" role="group" aria-label="Maximum tracks to send to AI">
@@ -421,6 +437,17 @@
                                         <option value="__scratch__">MediaSage - Now Playing</option>
                                     </select>
                                 </div>
+                                <div id="plex-user-container" class="plex-user-container hidden">
+                                    <label class="plex-user-label" for="plex-user-select">Playlist for</label>
+                                    <select id="plex-user-select" class="plex-user-select" aria-label="Plex user who will own this playlist">
+                                        <option value="__owner__">Me</option>
+                                    </select>
+                                    <select id="playlist-ownership-select" class="playlist-ownership-select hidden" aria-label="Who owns the saved playlist">
+                                        <option value="as_user">They own it</option>
+                                        <option value="copy_to_user">Mine + copy to them</option>
+                                    </select>
+                                </div>
+                                <p id="plex-user-hint" class="plex-user-hint hidden"></p>
                                 <div id="narrative-box" class="narrative-box hidden"></div>
                                 <div class="results-header-meta">
                                     <span id="results-track-count" class="meta-pill"></span>
@@ -635,6 +662,84 @@
 
             </div>
 
+            <!-- Import Spotify Playlist View -->
+            <div id="import-view" class="view">
+                <!-- 3-Step Progress Bar -->
+                <div id="imp-steps" class="step-progress" role="navigation" aria-label="Import steps">
+                    <div class="step active" data-step="input">
+                        <span class="step-circle">1</span>
+                        <span class="step-label">Paste</span>
+                    </div>
+                    <div class="step-connector"></div>
+                    <div class="step" data-step="preview">
+                        <span class="step-circle">2</span>
+                        <span class="step-label">Match</span>
+                    </div>
+                    <div class="step-connector"></div>
+                    <div class="step" data-step="results">
+                        <span class="step-circle">3</span>
+                        <span class="step-label">Playlist</span>
+                    </div>
+                </div>
+
+                <!-- Step Panels -->
+                <div class="import-step-content">
+                    <!-- Paste Step -->
+                    <div id="imp-step-input" class="imp-panel active">
+                        <h2>Import a Spotify playlist</h2>
+                        <p class="step-description">Paste a Spotify playlist link (or its <code>spotify:playlist:&hellip;</code>
+                            URI) or its bare id. We fetch its songs and match them against what you own.</p>
+                        <div class="form-group">
+                            <label for="imp-ref-input">Spotify playlist</label>
+                            <input type="text" id="imp-ref-input" class="search-input"
+                                   placeholder="https://open.spotify.com/playlist/&hellip;" aria-label="Spotify playlist reference">
+                        </div>
+                        <div class="form-group">
+                            <label for="imp-name-input">Playlist name <span class="optional-label">(optional)</span></label>
+                            <input type="text" id="imp-name-input" class="search-input"
+                                   placeholder="Defaults to the Spotify playlist's name">
+                        </div>
+                        <button id="imp-preview-btn" class="btn btn-primary">Preview matches</button>
+                    </div>
+
+                    <!-- Match Step -->
+                    <div id="imp-step-preview" class="imp-panel">
+                        <h2>What would match</h2>
+                        <p class="step-description">Each matched song says how it landed: the same song, another
+                            version of it, or the same title and album under another artist credit.</p>
+                        <div id="imp-preview-summary" class="spotify-import-summary"></div>
+                        <div id="imp-preview-warnings" class="spotify-import-warnings hidden"></div>
+                        <div id="imp-preview-matched" class="spotify-import-list" role="list" aria-label="Songs you own"></div>
+                        <div id="imp-preview-missing" class="spotify-import-list" role="list" aria-label="Songs your library lacks"></div>
+                        <button id="imp-import-btn" class="btn btn-primary" disabled>Create Plex playlist</button>
+                        <button id="imp-start-over-btn" class="btn btn-secondary">Different playlist</button>
+                    </div>
+
+                    <!-- Results Step -->
+                    <div id="imp-step-results" class="imp-panel">
+                        <div id="imp-result" class="spotify-import-result"></div>
+                        <div id="imp-result-list" class="spotify-import-list" role="list" aria-label="Songs kept on the wish list"></div>
+                        <div class="import-actions">
+                            <button id="imp-wishlist-btn" class="btn btn-secondary">Show the wish list</button>
+                            <button id="imp-another-btn" class="btn btn-secondary">Import another</button>
+                        </div>
+                    </div>
+
+                    <!-- Wish List Step (also reachable as #import-spotify/missing) -->
+                    <div id="imp-step-wishlist" class="imp-panel">
+                        <h2>Your wish list</h2>
+                        <p class="step-description">Songs your imported Spotify playlists asked for that this
+                            library cannot play. Re-importing a playlist refreshes its part of the list.</p>
+                        <div id="imp-wishlist-summary" class="spotify-wishlist-summary"></div>
+                        <div id="imp-wishlist-list" class="spotify-import-list" role="list" aria-label="Wish list songs"></div>
+                        <div class="import-actions">
+                            <button id="imp-wishlist-next-btn" class="btn btn-secondary" disabled>Next page</button>
+                            <button id="imp-import-btn-2" class="btn btn-secondary">Import a playlist</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Settings View -->
             <div id="settings-view" class="view">
                 <h2>Settings</h2>
@@ -757,6 +862,17 @@
                 <section class="settings-section library-stats" id="library-stats-section" style="display: none;">
                     <h3>Library Statistics</h3>
                     <div id="library-stats"></div>
+                </section>
+
+                <section class="settings-section memory-stats" id="memory-stats-section" style="display: none;">
+                    <h3>Ratings and Curation Memory</h3>
+                    <div id="memory-ratings" class="memory-ratings"></div>
+                    <div id="memory-reasoning" class="memory-reasoning"></div>
+                    <div class="settings-actions">
+                        <button id="rescan-ratings-btn" class="btn btn-secondary">
+                            Rescan Plex star ratings
+                        </button>
+                    </div>
                 </section>
             </div>
         </main>

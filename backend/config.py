@@ -1,16 +1,25 @@
 """Configuration loading with environment variable priority."""
 
 import os
+import logging
 from pathlib import Path
 from typing import Any
 
 import yaml
 from dotenv import load_dotenv
 
-from backend.models import AppConfig, DefaultsConfig, LLMConfig, PlexConfig
+from backend.models import (
+    AppConfig,
+    DefaultsConfig,
+    LLMConfig,
+    PlexConfig,
+    SpotifyConfig,
+)
 
 # Load .env file (if it exists) - env vars take priority
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # User config file path (for UI-saved settings)
 USER_CONFIG_PATH = Path("data/config.user.yaml")
@@ -150,7 +159,8 @@ def load_config(config_path: Path | None = None) -> AppConfig:
     plex_yaml = yaml_config.get("plex", {})
     llm_yaml = yaml_config.get("llm", {})
     defaults_yaml = yaml_config.get("defaults", {})
-
+    # Optional Spotify playlist import section (credentials or local parquet dump).
+    spotify_yaml = yaml_config.get("spotify", {})
     # Determine LLM provider - explicit setting or auto-detect from API keys
     explicit_provider = get_env_or_yaml(
         "LLM_PROVIDER", llm_yaml.get("provider"), None
@@ -218,6 +228,14 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         custom_context_window_str, str
     ) else custom_context_window_str
 
+    # LLM HTTP behavior (local inference servers can be slow)
+    request_timeout = float(
+        get_env_or_yaml("LLM_REQUEST_TIMEOUT", llm_yaml.get("request_timeout"), 600.0)
+    )
+    max_retries = int(
+        get_env_or_yaml("LLM_MAX_RETRIES", llm_yaml.get("max_retries"), 2)
+    )
+
     # Determine model names with proper fallback chain
     # When env var overrides to a DIFFERENT provider, use that provider's defaults
     # (prevents using custom provider's model names with gemini provider, etc.)
@@ -253,16 +271,31 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         ollama_context_window=ollama_context_window,
         custom_url=custom_url,
         custom_context_window=custom_context_window,
+        request_timeout=request_timeout,
+        max_retries=max_retries,
     )
 
     defaults_config = DefaultsConfig(
         track_count=defaults_yaml.get("track_count", 25)
     )
 
+    # Optional Spotify playlist import. Credentials win when present; otherwise a
+    # configured parquet dump resolves playlists from the local snapshot.
+    spotify_config = SpotifyConfig(
+        client_id=get_env_or_yaml("SPOTIFY_CLIENT_ID", spotify_yaml.get("client_id"), "") or "",
+        client_secret=get_env_or_yaml(
+            "SPOTIFY_CLIENT_SECRET", spotify_yaml.get("client_secret"), ""
+        ) or "",
+        parquet_dir=get_env_or_yaml(
+            "SPOTIFY_PARQUET_DIR", spotify_yaml.get("parquet_dir"), ""
+        ) or "",
+    )
+
     return AppConfig(
         plex=plex_config,
         llm=llm_config,
         defaults=defaults_config,
+        spotify=spotify_config,
     )
 
 
@@ -344,6 +377,11 @@ def update_config_values(updates: dict[str, Any]) -> AppConfig:
         llm_updates["custom_url"] = updates["custom_url"]
     if "custom_context_window" in updates and updates["custom_context_window"]:
         llm_updates["custom_context_window"] = updates["custom_context_window"]
+    # 0 is a valid value here (disables retries), so check for None explicitly
+    if updates.get("request_timeout") is not None:
+        llm_updates["request_timeout"] = float(updates["request_timeout"])
+    if updates.get("max_retries") is not None:
+        llm_updates["max_retries"] = int(updates["max_retries"])
 
     # Create new config with updates
     new_plex = _config.plex.model_copy(update=plex_updates)
@@ -353,6 +391,7 @@ def update_config_values(updates: dict[str, Any]) -> AppConfig:
         plex=new_plex,
         llm=new_llm,
         defaults=_config.defaults,
+        spotify=_config.spotify,
     )
 
     # Persist to user config file

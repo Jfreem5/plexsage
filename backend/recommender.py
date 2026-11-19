@@ -420,8 +420,12 @@ class RecommendationPipeline:
     ) -> dict:
         """Analyze a prompt and suggest relevant genre/decade filters.
 
-        Returns dict with 'genres', 'decades', and 'reasoning' keys.
-        Validates against available lists; falls back to all-available if empty.
+        Returns dict with 'genres', 'decades', 'reasoning', 'matched_hints' and
+        'excluded_genres' keys.  ``matched_hints`` is a list of
+        ``{"hint": phrase, "matches": [filters]}`` entries copied from the prompt
+        so the UI can show why each filter was pre-selected.  Validates against
+        the available lists; falls back to all-available when a list is empty.
+        Invented or repeated evidence is dropped and both evidence lists cap at 8.
         """
         system = (
             "You are a music librarian helping pre-select filters for an album recommendation.\n"
@@ -433,7 +437,10 @@ class RecommendationPipeline:
             "- For specific genre/era prompts: select narrowly.\n"
             "- When in doubt, include rather than exclude.\n"
             "- If no time period mentioned: select ALL decades.\n"
-            "Return JSON: { \"genres\": [...], \"decades\": [...], \"reasoning\": \"...\" }"
+            "Return JSON: { \"genres\": [...], \"decades\": [...], \"reasoning\": \"2-4 sentences naming "
+            "which part of the prompt drove each choice and what you left out and why\", "
+            "\"matched_hints\": [{\"hint\": \"phrase copied from the prompt\", \"matches\": [\"Genre\", ...]}], "
+            "\"excluded_genres\": [available genres you deliberately left out] }"
         )
 
         user_prompt = (
@@ -460,10 +467,34 @@ class RecommendationPipeline:
         if not decades:
             decades = list(available_decades)
 
+        # Keep only evidence that refers to filters that are really available, and
+        # show each phrase/genre once: the model can repeat or invent either.
+        available = genre_set | decade_set
+        matched_hints = []
+        seen_hints = set()
+        for entry in raw.get("matched_hints", []):
+            if not isinstance(entry, dict):
+                continue
+            phrase = str(entry.get("hint") or "").strip()
+            if not phrase or phrase in seen_hints:
+                continue
+            matches = [m for m in (entry.get("matches") or []) if m in available]
+            seen_hints.add(phrase)
+            matched_hints.append({"hint": phrase, "matches": matches})
+            if len(matched_hints) >= 8:
+                break
+
+        excluded_genres = []
+        for genre in raw.get("excluded_genres", []):
+            if genre in genre_set and genre not in excluded_genres:
+                excluded_genres.append(genre)
+
         return {
             "genres": genres,
             "decades": decades,
             "reasoning": raw.get("reasoning", ""),
+            "matched_hints": matched_hints,
+            "excluded_genres": excluded_genres[:8],
         }
 
     def generate_questions(

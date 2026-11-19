@@ -715,3 +715,86 @@ class TestSessionLifecycle:
         tokens, cost = pipeline.get_session_costs(sid)
         assert tokens == 0
         assert cost == 0.0
+
+
+class TestPromptFilterEvidence:
+    """analyze_prompt_filters must report evidence, not just a verdict."""
+
+    def test_prompt_asks_for_evidence_fields(self):
+        """The system prompt must demand matched_hints and excluded_genres."""
+        from backend.recommender import RecommendationPipeline
+
+        mock_llm = MagicMock()
+        mock_llm.generate.return_value = MagicMock(input_tokens=10, output_tokens=5, model="m")
+        mock_llm.parse_json_response.return_value = {}
+        pipeline = RecommendationPipeline(config=MagicMock(), llm_client=mock_llm)
+
+        genres = ["Rock", "Folk"]
+        decades = ["1990s"]
+        pipeline.analyze_prompt_filters("quiet guitar records", genres, decades)
+
+        calls = mock_llm.generate.call_args[0]
+        assert "matched_hints" in calls[1]
+        assert "excluded_genres" in calls[1]
+
+    def test_invented_excluded_genres_are_dropped(self):
+        """Genres outside the available list never reach the UI."""
+        from backend.recommender import RecommendationPipeline
+
+        mock_llm = MagicMock()
+        mock_llm.generate.return_value = MagicMock(input_tokens=10, output_tokens=5, model="m")
+        mock_llm.parse_json_response.return_value = {
+            "genres": ["Rock", "Noise"],
+            "decades": ["1990s", "2070s"],
+            "reasoning": "Rock fits; Noise is not in the library list.",
+            "matched_hints": [
+                {"hint": "loud", "matches": ["Rock", "Invented Genre"]},
+                "not-a-dict",
+                {"hint": "", "matches": ["Rock"]},
+            ],
+            "excluded_genres": ["Folk", "Made Up Genre", "Folk"],
+        }
+        pipeline = RecommendationPipeline(config=MagicMock(), llm_client=mock_llm)
+
+        result = pipeline.analyze_prompt_filters(
+            "loud", ["Rock", "Folk"], ["1990s", "2000s"]
+        )
+
+        assert result["genres"] == ["Rock"]
+        assert result["decades"] == ["1990s"]
+        assert result["excluded_genres"] == ["Folk"]
+        assert result["matched_hints"] == [{"hint": "loud", "matches": ["Rock"]}]
+
+    def test_empty_evidence_still_returns_filters(self):
+        """A model that ignores the evidence fields must not break the response."""
+        from backend.recommender import RecommendationPipeline
+
+        mock_llm = MagicMock()
+        mock_llm.generate.return_value = MagicMock(input_tokens=10, output_tokens=5, model="m")
+        mock_llm.parse_json_response.return_value = {"genres": [], "decades": []}
+        pipeline = RecommendationPipeline(config=MagicMock(), llm_client=mock_llm)
+
+        result = pipeline.analyze_prompt_filters("anything", ["Rock"], ["1990s"])
+
+        assert result["genres"] == ["Rock"]
+        assert result["decades"] == ["1990s"]
+        assert result["matched_hints"] == []
+        assert result["excluded_genres"] == []
+
+    def test_matched_hints_are_capped(self):
+        """Evidence is a display affordance, so cap the rows like the analyzer does."""
+        from backend.recommender import RecommendationPipeline
+
+        mock_llm = MagicMock()
+        mock_llm.generate.return_value = MagicMock(input_tokens=10, output_tokens=5, model="m")
+        mock_llm.parse_json_response.return_value = {
+            "genres": ["Rock"],
+            "decades": ["1990s"],
+            "matched_hints": [{"hint": f"h{i}", "matches": ["Rock"]} for i in range(12)],
+        }
+        pipeline = RecommendationPipeline(config=MagicMock(), llm_client=mock_llm)
+
+        result = pipeline.analyze_prompt_filters("h0 h1", ["Rock"], ["1990s"])
+
+        assert len(result["matched_hints"]) == 8
+        assert [h["hint"] for h in result["matched_hints"]] == [f"h{i}" for i in range(8)]

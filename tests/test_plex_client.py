@@ -3,6 +3,7 @@
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
 from requests.exceptions import ConnectionError as RequestsConnectionError
 
 from backend.models import PlexPlaylistInfo, Track
@@ -1142,3 +1143,625 @@ class TestPlexClientUpdatePlaylist:
         assert result["success"] is True
         assert result["tracks_added"] == 1
         assert result["tracks_skipped"] == 2
+
+
+class TestPlexClientUserPlaylists:
+    """Tests for creating/updating playlists inside other Plex users' accounts."""
+
+    MACHINE_ID = "server-machine-id"
+
+    def _make_client(self, mock_server=None):
+        """Build a connected PlexClient around a mocked PlexServer."""
+        from backend.plex_client import PlexClient
+
+        server = mock_server if mock_server is not None else MagicMock()
+        server.library.section.return_value = MagicMock()
+        server.machineIdentifier = self.MACHINE_ID
+        with patch("backend.plex_client.PlexServer", return_value=server):
+            return PlexClient("http://localhost:32400", "token", "Music")
+
+    def _make_user(self, key, title=None, account_id=10, username=None, restriction_profile=None):
+        """Mock of plexapi's MyPlexUser. Home users have a title but no username."""
+        user = MagicMock()
+        user.id = account_id
+        user.username = key if username is None else username
+        user.title = title or key
+        user.home = False
+        user.protected = False
+        user.managed = False
+        user._data = {} if restriction_profile is None else {"restrictionProfile": restriction_profile}
+        user.servers = [MagicMock(machineIdentifier=self.MACHINE_ID)]
+        return user
+
+    def _make_account(self, users, title="Library Owner"):
+        account = MagicMock()
+        account.title = title
+        account.id = 1
+        account.users.return_value = users
+        return account
+
+    def _make_user_server(self, account_id=99, playlist_key="555"):
+        """Mock of the PlexServer connection returned by server.switchUser()."""
+        server = MagicMock()
+        server.account = MagicMock(id=account_id)
+        server.machineIdentifier = self.MACHINE_ID
+        server.fetchItem.side_effect = lambda key: MagicMock(ratingKey=key)
+        server.createPlaylist.return_value = MagicMock(ratingKey=playlist_key)
+        server.playlists.return_value = []
+        return server
+
+    def test_get_users_lists_owner_first_then_alphabetically(self):
+        """The connected account leads the list, other accounts are name-sorted."""
+        from backend.plex_client import OWNER_USER_KEY
+
+        mock_server = MagicMock()
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("zoe", title="Zoe", account_id=3),
+             self._make_user("", title="amy", username="", account_id=2)],
+            title="freem716",
+        )
+        client = self._make_client(mock_server)
+
+        users = client.get_users()
+
+        assert [u.key for u in users] == [OWNER_USER_KEY, "amy", "zoe"]
+        assert users[0].is_owner is True
+        assert users[0].title == "freem716"
+        assert users[1].title == "amy"
+        assert users[1].user_id == 2
+
+    def test_get_users_reports_profile_details(self):
+        """Managed (kids) profiles and PIN-protected accounts are flagged."""
+        managed = self._make_user("kid", title="The Boys", restriction_profile="older_kid")
+        pinned = self._make_user("padai", title="padai8")
+        pinned.protected = True
+
+        mock_server = MagicMock()
+        mock_server.myPlexAccount.return_value = self._make_account([managed, pinned])
+        client = self._make_client(mock_server)
+
+        by_key = {u.key: u for u in client.get_users()}
+
+        assert by_key["kid"].is_managed is True
+        assert by_key["kid"].has_pin is False
+        assert by_key["padai"].is_managed is False
+        assert by_key["padai"].has_pin is True
+
+    def test_get_users_excludes_accounts_without_this_server(self):
+        """Only users shared into our server can own playlists here."""
+        elsewhere = self._make_user("remote", title="Remote User")
+        elsewhere.servers = [MagicMock(machineIdentifier="another-server")]
+
+        mock_server = MagicMock()
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [elsewhere, self._make_user("local", title="Local User")]
+        )
+        client = self._make_client(mock_server)
+
+        keys = [u.key for u in client.get_users()]
+
+        assert keys == ["__owner__", "local"]
+
+    def test_get_users_falls_back_to_owner_when_plex_tv_fails(self):
+        """A plex.tv outage still leaves our own account selectable."""
+        from backend.plex_client import OWNER_USER_KEY
+
+        mock_server = MagicMock()
+        mock_server.myPlexAccount.side_effect = Exception("plex.tv unreachable")
+        client = self._make_client(mock_server)
+
+        users = client.get_users()
+
+        assert len(users) == 1
+        assert users[0].key == OWNER_USER_KEY
+        assert users[0].title == "Owner"
+
+    def test_owner_placeholder_reuses_connected_server(self):
+        """'__owner__' (and no user at all) means our own Plex connection."""
+        from backend.plex_client import OWNER_USER_KEY
+
+        client = self._make_client()
+
+        assert client._server_for_user(OWNER_USER_KEY) is client._server
+        assert client._server_for_user(None) is client._server
+        assert client._server_for_user("") is client._server
+        client._server.switchUser.assert_not_called()
+
+    def test_server_for_user_connects_once_and_caches(self):
+        """The impersonated connection is reused until it is refreshed."""
+        mock_server = MagicMock()
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy")]
+        )
+        other = self._make_user_server(account_id=42)
+        mock_server.switchUser.return_value = other
+        client = self._make_client(mock_server)
+
+        first = client._server_for_user("amy")
+        second = client._server_for_user("amy")
+
+        assert first is other
+        assert second is other
+        mock_server.switchUser.assert_called_once()
+
+        client._server_for_user("amy", refresh=True)
+        assert mock_server.switchUser.call_count == 2
+
+    def test_server_for_unknown_user_raises(self):
+        """A key that is not on our share list is rejected instead of guessed."""
+        from backend.plex_client import PlexQueryError
+
+        mock_server = MagicMock()
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy")]
+        )
+        client = self._make_client(mock_server)
+
+        with pytest.raises(PlexQueryError, match="Unknown Plex user"):
+            client._server_for_user("nobody")
+
+        client._server.switchUser.assert_not_called()
+
+    def test_create_playlist_as_another_user(self):
+        """Passing 'user' writes the playlist inside that account instead of ours."""
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=1)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42)]
+        )
+        other = self._make_user_server(account_id=42)
+        mock_server.switchUser.return_value = other
+        client = self._make_client(mock_server)
+
+        result = client.create_playlist("Road Trip", ["1", "2"], description="notes", user="amy")
+
+        assert result["success"] is True
+        assert result["owner"] == "Amy"
+        assert result["copies"] == []
+        assert other.createPlaylist.call_args[0][0] == "Road Trip"
+        assert len(other.createPlaylist.call_args[1]["items"]) == 2
+        mock_server.createPlaylist.assert_not_called()
+
+    def test_create_playlist_for_unknown_user_fails_without_writing(self):
+        mock_server = MagicMock()
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy")]
+        )
+        client = self._make_client(mock_server)
+
+        result = client.create_playlist("Road Trip", ["1", "2"], user="nobody")
+
+        assert result["success"] is False
+        assert "Unknown Plex user" in result["error"]
+        mock_server.createPlaylist.assert_not_called()
+
+    def test_create_playlist_copies_into_each_extra_account(self):
+        """'copy_to' gives every listed user their own copy of the playlist."""
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=1)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42),
+             self._make_user("leo", title="Leo", account_id=43)]
+        )
+        amy_server = self._make_user_server(account_id=42, playlist_key="11")
+        leo_server = self._make_user_server(account_id=43, playlist_key="22")
+        mock_server.switchUser.side_effect = [amy_server, leo_server]
+        client = self._make_client(mock_server)
+
+        result = client.create_playlist("Road Trip", ["1", "2"], user=None, copy_to=["amy", "leo"])
+
+        assert result["success"] is True
+        # The main playlist stays in our own account...
+        mock_server.createPlaylist.assert_called_once()
+        assert result["owner"] == "Library Owner"
+        # ...and each extra user gets a copy that they own.
+        assert [(c["user"], c["success"], c["playlist_id"]) for c in result["copies"]] == [
+            ("Amy", True, "11"),
+            ("Leo", True, "22"),
+        ]
+
+    def test_create_playlist_copy_failure_does_not_lose_the_main_playlist(self):
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=1)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42),
+             self._make_user("gone", title="Gone", account_id=43)]
+        )
+        amy_server = self._make_user_server(account_id=42)
+
+        def switch(user):
+            if getattr(user, "title", None) == "Gone":
+                raise RuntimeError("share revoked")
+            return amy_server
+
+        mock_server.switchUser.side_effect = switch
+        client = self._make_client(mock_server)
+
+        result = client.create_playlist("Road Trip", ["1"], copy_to=["gone", "amy"])
+
+        assert result["success"] is True
+        mock_server.createPlaylist.assert_called_once()
+        by_user = {c["user"]: c for c in result["copies"]}
+        assert by_user["Amy"]["success"] is True
+        assert by_user["Gone"]["success"] is False
+        assert "share revoked" in by_user["Gone"]["error"]
+
+    def test_copy_to_the_account_we_already_wrote_to_is_skipped(self):
+        """A copy that would land next to the playlist we just made is dropped."""
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=7)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=7)]
+        )
+        amy_server = self._make_user_server(account_id=7)
+        mock_server.switchUser.return_value = amy_server
+        client = self._make_client(mock_server)
+
+        result = client.create_playlist("Road Trip", ["1"], copy_to=["amy"])
+
+        assert result["success"] is True
+        assert result["copies"] == []
+        mock_server.createPlaylist.assert_called_once()
+        amy_server.createPlaylist.assert_not_called()
+
+    def test_copy_to_blanks_and_placeholder_are_ignored(self):
+        from backend.plex_client import OWNER_USER_KEY
+
+        client = self._make_client()
+
+        result = client.create_playlist("Road Trip", ["1"], copy_to=[OWNER_USER_KEY, "", None])
+
+        assert result["success"] is True
+        assert result["copies"] == []
+        client._server.createPlaylist.assert_called_once()
+
+    def test_get_playlists_lists_the_selected_users_playlists(self):
+        mock_server = MagicMock()
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42)]
+        )
+        ours = self._make_mock_playlist(rating_key=1, title="Mine")
+        mock_server.playlists.return_value = [ours]
+        theirs = self._make_mock_playlist(rating_key=2, title="Hers", leaf_count=7)
+        other = self._make_user_server(account_id=42)
+        other.playlists.return_value = [theirs]
+        mock_server.switchUser.return_value = other
+        client = self._make_client(mock_server)
+
+        playlists = client.get_playlists("amy")
+
+        assert [p.title for p in playlists] == ["Hers"]
+        assert playlists[0].track_count == 7
+
+    def test_get_playlists_for_unknown_user_returns_empty(self):
+        mock_server = MagicMock()
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy")]
+        )
+        mock_server.playlists.return_value = [self._make_mock_playlist(rating_key=1)]
+        client = self._make_client(mock_server)
+
+        assert client.get_playlists("nobody") == []
+
+    def test_update_playlist_writes_to_the_selected_users_playlist(self):
+        mock_server = MagicMock()
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42)]
+        )
+        other = self._make_user_server(account_id=42)
+        their_playlist = MagicMock(ratingKey=10, title="Hers", leafCount=0)
+        their_playlist.items.return_value = []
+        other.fetchItem.side_effect = lambda key: (
+            their_playlist if key == 10 else MagicMock(ratingKey=key)
+        )
+        mock_server.switchUser.return_value = other
+        our_playlist = MagicMock(ratingKey=10, title="Mine")
+        mock_server.fetchItem.return_value = our_playlist
+        client = self._make_client(mock_server)
+
+        result = client.update_playlist(
+            playlist_id="10",
+            rating_keys=["101"],
+            mode="append",
+            user="amy",
+        )
+
+        assert result["success"] is True
+        assert result["owner"] == "Amy"
+        their_playlist.addItems.assert_called_once()
+        our_playlist.addItems.assert_not_called()
+
+    def test_update_playlist_for_unknown_user_fails_without_writing(self):
+        mock_server = MagicMock()
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy")]
+        )
+        client = self._make_client(mock_server)
+
+        result = client.update_playlist(playlist_id="10", rating_keys=["101"], user="nobody")
+
+        assert result["success"] is False
+        assert "Unknown Plex user" in result["error"]
+        mock_server.fetchItem.assert_not_called()
+
+    def test_move_playlist_creates_it_inside_the_other_account(self):
+        """The destination owns a new copy of our playlist; ours stays put."""
+        ours = self._make_source_playlist()
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=1)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42)]
+        )
+        mock_server.fetchItem.return_value = ours
+        theirs = self._make_user_server(account_id=42, playlist_key="555")
+        mock_server.switchUser.return_value = theirs
+        client = self._make_client(mock_server)
+
+        result = client.move_playlist("115", to_user="amy")
+
+        assert result["success"] is True
+        assert result["from"] == "Library Owner"
+        assert result["owner"] == "Amy"
+        assert result["playlist_id"] == "555"
+        assert result["tracks_added"] == 2
+        assert result["source_deleted"] is False
+        assert result["copies"] == []
+        assert theirs.createPlaylist.call_args[0][0] == "Boys requests"
+        mock_server.createPlaylist.assert_not_called()
+        ours.delete.assert_not_called()
+
+    def test_move_playlist_deletes_the_original_when_asked(self):
+        """delete_source is what makes it a move instead of a copy."""
+        ours = self._make_source_playlist()
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=1)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42)]
+        )
+        mock_server.fetchItem.return_value = ours
+        theirs = self._make_user_server(account_id=42, playlist_key="555")
+        mock_server.switchUser.return_value = theirs
+        client = self._make_client(mock_server)
+
+        result = client.move_playlist("115", to_user="amy", delete_source=True)
+
+        assert result["success"] is True
+        assert result["source_deleted"] is True
+        ours.delete.assert_called_once()
+        theirs.createPlaylist.assert_called_once()
+
+    def test_move_playlist_refuses_two_keys_that_are_one_account(self):
+        """A member whose account id equals ours is the same account, not a move."""
+        ours = self._make_source_playlist()
+        mock_server = MagicMock()
+        account = self._make_account([self._make_user("amy", title="Amy", account_id=7)])
+        account.id = 7
+        mock_server.myPlexAccount.return_value = account
+        theirs = self._make_user_server(account_id=7)
+        mock_server.switchUser.return_value = theirs
+        client = self._make_client(mock_server)
+
+        result = client.move_playlist("115", to_user="amy")
+
+        assert result["success"] is False
+        assert "same Plex account" in result["error"]
+        theirs.createPlaylist.assert_not_called()
+
+    def test_move_playlist_placeholder_and_blank_are_the_same_account(self):
+        """Moving the owner's playlist onto the owner is refused, not guessed."""
+        from backend.plex_client import OWNER_USER_KEY
+
+        client = self._make_client()
+
+        result = client.move_playlist("115", to_user=OWNER_USER_KEY, from_user="")
+
+        assert result["success"] is False
+        assert "same Plex account" in result["error"]
+        client._server.fetchItem.assert_not_called()
+        client._server.switchUser.assert_not_called()
+
+    def test_move_playlist_unknown_destination_fails_without_writing(self):
+        """An unknown key is rejected before anything is read or written."""
+        ours = self._make_source_playlist()
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=1)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42)]
+        )
+        mock_server.fetchItem.return_value = ours
+        theirs = self._make_user_server(account_id=42)
+        mock_server.switchUser.return_value = theirs
+        client = self._make_client(mock_server)
+
+        result = client.move_playlist("115", to_user="nobody")
+
+        assert result["success"] is False
+        assert "Unknown Plex user" in result["error"]
+        mock_server.fetchItem.assert_not_called()
+        mock_server.switchUser.assert_not_called()
+
+    def test_move_playlist_accepts_a_title_as_well_as_a_rating_key(self):
+        """A playlist can be named the way Plex spells it, not only keyed."""
+        ours = self._make_source_playlist(title="Road Trip")
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=1)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42)]
+        )
+        mock_server.playlists.return_value = [ours]
+        theirs = self._make_user_server(account_id=42)
+        mock_server.switchUser.return_value = theirs
+        client = self._make_client(mock_server)
+
+        result = client.move_playlist("Road Trip", to_user="amy")
+
+        assert result["success"] is True
+        assert theirs.createPlaylist.call_args[0][0] == "Road Trip"
+        mock_server.fetchItem.assert_not_called()
+
+    def test_move_playlist_missing_title_lists_the_ones_that_exist(self):
+        """A straight apostrophe in a title says so and shows the real titles."""
+        ours = self._make_source_playlist(title="Boys\u2019 requests")
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=1)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42)]
+        )
+        mock_server.playlists.return_value = [ours]
+        theirs = self._make_user_server(account_id=42)
+        mock_server.switchUser.return_value = theirs
+        client = self._make_client(mock_server)
+
+        result = client.move_playlist("Boys' requests", to_user="amy")
+
+        assert result["success"] is False
+        assert "U+2019" in result["error"]
+        assert "Boys\u2019 requests" in result["error"]
+        theirs.createPlaylist.assert_not_called()
+
+    def test_move_playlist_unknown_owner_fails_without_reading(self):
+        """The source account is resolved before its playlist is ever read."""
+        ours = self._make_source_playlist()
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=1)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42)]
+        )
+        mock_server.fetchItem.return_value = ours
+        theirs = self._make_user_server(account_id=42)
+        mock_server.switchUser.return_value = theirs
+        client = self._make_client(mock_server)
+
+        result = client.move_playlist("115", to_user="amy", from_user="nobody")
+
+        assert result["success"] is False
+        assert "Unknown Plex user" in result["error"]
+        mock_server.switchUser.assert_not_called()
+        theirs.createPlaylist.assert_not_called()
+
+    def test_move_playlist_copy_to_hands_the_playlist_to_extra_accounts(self):
+        """copy_to gives further household members their own copy too."""
+        ours = self._make_source_playlist()
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=1)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42),
+             self._make_user("leo", title="Leo", account_id=43)]
+        )
+        mock_server.fetchItem.return_value = ours
+        amy_server = self._make_user_server(account_id=42, playlist_key="555")
+        leo_server = self._make_user_server(account_id=43, playlist_key="666")
+        mock_server.switchUser.side_effect = [amy_server, leo_server]
+        client = self._make_client(mock_server)
+
+        result = client.move_playlist("115", to_user="amy", copy_to=["leo"])
+
+        assert result["success"] is True
+        assert [(c["user"], c["playlist_id"]) for c in result["copies"]] == [("Leo", "666")]
+        amy_server.createPlaylist.assert_called_once()
+        leo_server.createPlaylist.assert_called_once()
+
+    def test_move_playlist_refuses_a_playlist_with_no_reusable_tracks(self):
+        """Nothing is written when the source has no track leaves to re-fetch."""
+        ours = self._make_source_playlist(track_keys=())
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=1)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42)]
+        )
+        mock_server.fetchItem.return_value = ours
+        theirs = self._make_user_server(account_id=42)
+        mock_server.switchUser.return_value = theirs
+        client = self._make_client(mock_server)
+
+        result = client.move_playlist("115", to_user="amy")
+
+        assert result["success"] is False
+        assert result["tracks_skipped"] == 0
+        assert "No valid tracks found" in result["error"]
+        theirs.createPlaylist.assert_not_called()
+
+    def test_move_playlist_reports_a_source_it_could_not_delete(self):
+        """The copy still counts as done when the original survives."""
+        ours = self._make_source_playlist()
+        ours.delete.side_effect = RuntimeError("already deleted elsewhere")
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=1)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42)]
+        )
+        mock_server.fetchItem.return_value = ours
+        theirs = self._make_user_server(account_id=42, playlist_key="555")
+        mock_server.switchUser.return_value = theirs
+        client = self._make_client(mock_server)
+
+        result = client.move_playlist("115", to_user="amy", delete_source=True)
+
+        assert result["success"] is True
+        assert result["source_deleted"] is False
+        assert "original was not deleted" in result["error"]
+
+    def test_move_playlist_copy_to_the_destination_is_dropped(self):
+        """A copy aimed at the account that already got the move is skipped."""
+        ours = self._make_source_playlist()
+        mock_server = MagicMock()
+        mock_server.account = MagicMock(id=1)
+        mock_server.myPlexAccount.return_value = self._make_account(
+            [self._make_user("amy", title="Amy", account_id=42)]
+        )
+        mock_server.fetchItem.return_value = ours
+        theirs = self._make_user_server(account_id=42, playlist_key="555")
+        mock_server.switchUser.return_value = theirs
+        client = self._make_client(mock_server)
+
+        result = client.move_playlist("115", to_user="amy", copy_to=["amy"])
+
+        assert result["success"] is True
+        assert result["copies"] == []
+        theirs.createPlaylist.assert_called_once()
+
+    @staticmethod
+    def _make_mock_playlist(rating_key=1, title="Test Playlist", leaf_count=10):
+        playlist = MagicMock()
+        playlist.ratingKey = rating_key
+        playlist.title = title
+        playlist.leafCount = leaf_count
+        playlist.smart = False
+        playlist.radio = False
+        return playlist
+
+    @staticmethod
+    def _make_source_playlist(rating_key=115, title="Boys requests", track_keys=(101, 102)):
+        """A playlist one account owns, as plexapi hands it to us (leaves included)."""
+        playlist = MagicMock()
+        playlist.ratingKey = rating_key
+        playlist.title = title
+        playlist.summary = "notes"
+        playlist.items.return_value = [
+            MagicMock(ratingKey=key, type="track") for key in track_keys
+        ]
+        return playlist
+
+
+class TestJoinKeyHelpers:
+    """The plexclean key convention this repo vendors, shared by the cache and imports."""
+
+    def test_song_key_joins_the_three_normalized_parts(self):
+        """A title/album/artist triple normalizes to one predictable key."""
+        from backend.plex_client import song_key
+
+        assert song_key("Say It Ain't So", "Weezer (Blue Album)", "Weezer") == (
+            "say it aint so|weezer blue album|weezer"
+        )
+
+    def test_artist_key_folds_connectors(self):
+        """Band spellings joined with & or "and" share one artist key."""
+        from backend.plex_client import artist_key
+
+        assert artist_key("Simon & Garfunkel") == artist_key("Simon and Garfunkel")
+
+    def test_album_key_ignores_the_track_and_artist(self):
+        """An album-level row keys on the album name alone."""
+        from backend.plex_client import album_key
+
+        assert album_key("(What's the Story) Morning Glory?") == "whats the story morning glory"

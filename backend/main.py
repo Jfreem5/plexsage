@@ -41,9 +41,14 @@ from backend.models import (
     OllamaModelsResponse,
     OllamaStatus,
     PlexClientInfo,
+    PlexPlaylistCopy,
     PlexPlaylistInfo,
+    PlexUserRatingsStatus,
+    PlexUserInfo,
     PlayQueueRequest,
     PlayQueueResponse,
+    RefreshUserRatingsRequest,
+    RefreshUserRatingsResponse,
     RecommendGenerateRequest,
     RecommendGenerateResponse,
     RecommendQuestionsRequest,
@@ -51,6 +56,8 @@ from backend.models import (
     RecommendSessionState,
     RecommendSwitchModeRequest,
     RecommendSwitchModeResponse,
+    ReasoningStatusResponse,
+    ReasoningTagStat,
     ResultDetail,
     ResultListItem,
     ResultListResponse,
@@ -58,20 +65,41 @@ from backend.models import (
     SavePlaylistResponse,
     SetupCompleteResponse,
     SetupStatusResponse,
+    SpotifyImportPreviewRequest,
+    SpotifyImportPreviewResponse,
+    SpotifyImportRequest,
+    SpotifyImportResponse,
+    SpotifyMatchedTrack,
+    SpotifyMissingListResponse,
+    SpotifyMissingSong,
     SyncProgress,
     SyncTriggerResponse,
     Track,
     UpdateConfigRequest,
     UpdatePlaylistRequest,
     UpdatePlaylistResponse,
+    UserRatingsStatusResponse,
     ValidateAIRequest,
     ValidateAIResponse,
     ValidatePlexRequest,
     ValidatePlexResponse,
+    OWNER_USER_KEY,
     album_key,
 )
-from backend.plex_client import PlexClient as PlexClientInstance, get_plex_client, init_plex_client
+from backend.plex_client import (
+    PlexClient as PlexClientInstance,
+    PlexQueryError,
+    get_plex_client,
+    init_plex_client,
+)
 from backend import library_cache
+from backend import agent_reasoning
+from backend.spotify_import import (
+    SpotifyImportError,
+    fetch_playlist,
+    match_cached,
+    match_live,
+)
 from backend.llm_client import (
     TOKENS_PER_ALBUM,
     estimate_cost_for_model,
@@ -85,7 +113,12 @@ from backend.llm_client import (
     list_ollama_models,
 )
 from backend.analyzer import analyze_prompt as do_analyze_prompt, analyze_track as do_analyze_track
-from backend.generator import compute_track_budget, generate_playlist_stream
+from backend.generator import (
+    candidate_facets,
+    compute_track_budget,
+    generate_playlist_stream,
+    relax_candidate_pool,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -373,7 +406,7 @@ async def setup_validate_ai(request: ValidateAIRequest) -> ValidateAIResponse:
             headers = {}
             if request.api_key:
                 headers["Authorization"] = f"Bearer {request.api_key}"
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(f"{request.custom_url.rstrip('/')}/models", headers=headers)
                 resp.raise_for_status()
 
@@ -556,6 +589,81 @@ async def trigger_library_sync() -> SyncTriggerResponse:
 
 
 # =============================================================================
+# Per-account Ratings + Curation Memory (local cache state)
+# =============================================================================
+
+
+@app.get("/api/library/ratings/status", response_model=UserRatingsStatusResponse)
+async def get_user_ratings_status() -> UserRatingsStatusResponse:
+    """Which Plex accounts the cache holds star ratings for.
+
+    The admin account never appears: its stars are every track's ``user_rating``
+    column, which is also the fallback for a track a household member never rated.
+    An account missing here is "not scanned yet", not "rated nothing" — that
+    distinction is what decides whether a ``min_rating`` floor can read a member.
+    """
+    state = await asyncio.to_thread(library_cache.user_ratings_status)
+    return UserRatingsStatusResponse(
+        total_tracks=state["total_tracks"],
+        users=[PlexUserRatingsStatus(**user) for user in state["users"]],
+        synced_users=state["synced_users"],
+    )
+
+
+@app.post("/api/library/ratings/refresh", response_model=RefreshUserRatingsResponse)
+async def refresh_user_ratings(request: RefreshUserRatingsRequest) -> RefreshUserRatingsResponse:
+    """Re-scan Plex accounts' own star ratings into the cache.
+
+    An empty ``users`` list means every account already cached: an account that was
+    never scanned has nothing to rewrite, and the first filter asking for its stars
+    pays the scan on its own. A failed scan is named per account rather than counted
+    as zero rows, which would read as "this member rated nothing" and drop every
+    track they rated out of a rating floor.
+    """
+    plex_client = get_plex_client()
+    if not plex_client or not plex_client.is_connected():
+        raise HTTPException(status_code=503, detail="Plex not connected")
+
+    targets = request.users or (await asyncio.to_thread(library_cache.user_ratings_status))["synced_users"]
+    refreshed: list[str] = []
+    errors: dict[str, str] = {}
+    for key in targets:
+        if key == OWNER_USER_KEY:
+            continue  # The admin's stars already are the tracks' user_rating column.
+        try:
+            await asyncio.to_thread(library_cache.sync_user_ratings, key, plex_client)
+            refreshed.append(key)
+        except PlexQueryError as exc:
+            errors[key] = str(exc)
+
+    state = await asyncio.to_thread(library_cache.user_ratings_status)
+    return RefreshUserRatingsResponse(
+        refreshed=refreshed,
+        errors=errors,
+        status=UserRatingsStatusResponse(
+            total_tracks=state["total_tracks"],
+            users=[PlexUserRatingsStatus(**user) for user in state["users"]],
+            synced_users=state["synced_users"],
+        ),
+    )
+
+
+@app.get("/api/reasoning/status", response_model=ReasoningStatusResponse)
+async def get_reasoning_status() -> ReasoningStatusResponse:
+    """Curation memory the curator has written: runs, per-track reasons, mined tags."""
+    payload = await asyncio.to_thread(agent_reasoning.reasoning_status)
+    return ReasoningStatusResponse(
+        runs=payload.get("runs", 0),
+        selections=payload.get("selections", 0),
+        tracks_with_reasons=payload.get("tracks_with_reasons", 0),
+        tagged_tracks=payload.get("tagged_tracks", 0),
+        tags=[ReasoningTagStat(**tag) for tag in payload.get("tags", [])],
+        last_run_at=payload.get("last_run_at"),
+        error=payload.get("error"),
+    )
+
+
+# =============================================================================
 # Library Endpoints
 # =============================================================================
 
@@ -658,22 +766,78 @@ async def preview_filters(request: FilterPreviewRequest) -> FilterPreviewRespons
 
     genres = request.genres if request.genres else None
     decades = request.decades if request.decades else None
+    artists = request.artists if request.artists else None
+    exclude_genres = request.exclude_genres if request.exclude_genres else None
     exclude_live = request.exclude_live
     min_rating = request.min_rating
 
+    # ``rating_user`` asks for a household member's stars, which live only in the
+    # cache's ``user_ratings`` table: ``tracks.user_rating`` is the connecting admin's
+    # column. That account is scanned once here (every later request pays nothing), and
+    # the two ways it cannot be honoured are reported rather than swallowed — a failed
+    # scan counted as "this member rated nothing" would drop every track they rated
+    # out of a ``min_rating`` floor, since the effective rating is COALESCE(user_ratings,
+    # tracks.user_rating) and falling back to the admin's column looks like a real zero.
+    rating_user = (request.rating_user or "").strip()
+    rating_used = ""
+    rating_error = ""
+    using_cache = library_cache.has_cached_tracks()
+    if rating_user and rating_user != OWNER_USER_KEY:
+        if not using_cache:
+            rating_error = (
+                "another account's stars exist only in the local cache, so this live-Plex "
+                "count read the admin's column: sync the library first"
+            )
+        elif not plex_client or not plex_client.is_connected():
+            rating_error = "Plex not connected: that account's ratings could not be scanned"
+        else:
+            try:
+                await asyncio.to_thread(
+                    library_cache.ensure_user_ratings, rating_user, plex_client
+                )
+                rating_used = rating_user
+            except PlexQueryError as exc:
+                rating_error = f"ratings scan failed for '{rating_user}': {exc}"
+
     # Try cache first for instant response
     matching_tracks = -1
-    if library_cache.has_cached_tracks():
-        matching_tracks = await asyncio.to_thread(
-            library_cache.count_tracks_by_filters,
-            genres=genres,
-            decades=decades,
-            min_rating=min_rating,
-            exclude_live=exclude_live,
+    ladder = None
+    if using_cache:
+        # The filters the request suggests can leave fewer candidates than the
+        # AI step wants to choose from (one rating floor the analyzer invented cut
+        # 337 Holiday tracks to 5), and the generation run widens them tier by
+        # tier. Do the same walk here so the preview reports the pool the run will
+        # actually use and prices the right number of tracks.
+        ladder = await asyncio.to_thread(
+            relax_candidate_pool,
+            candidate_facets(
+                genres=request.genres,
+                decades=request.decades,
+                artists=request.artists,
+                exclude_genres=request.exclude_genres,
+                exclude_artists=request.exclude_artists,
+                exclude_decades=request.exclude_decades,
+                min_year=request.min_year,
+                max_year=request.max_year,
+                min_plays=request.min_plays,
+                max_plays=request.max_plays,
+                unheard_only=request.unheard_only,
+                exclude_compilations=request.exclude_compilations,
+                min_rating=request.min_rating,
+                min_duration_ms=request.min_duration_ms,
+                max_duration_ms=request.max_duration_ms,
+                exclude_live=request.exclude_live,
+                rating_user=rating_used,
+            ),
+            request.prompt,
+            request.track_count,
+            request.max_tracks_to_ai,
         )
+        matching_tracks = ladder["matching"]
 
     # Fall back to Plex if cache is empty
     if matching_tracks < 0:
+        ladder = None  # the ladder only speaks for the cache, so drop its numbers
         if not plex_client or not plex_client.is_connected():
             raise HTTPException(status_code=503, detail="Plex not connected")
 
@@ -681,8 +845,20 @@ async def preview_filters(request: FilterPreviewRequest) -> FilterPreviewRespons
             plex_client.count_tracks_by_filters,
             genres=genres,
             decades=decades,
-            exclude_live=exclude_live,
+            artists=artists,
+            exclude_genres=exclude_genres,
+            exclude_artists=request.exclude_artists,
+            exclude_decades=request.exclude_decades,
             min_rating=min_rating,
+            min_duration_ms=request.min_duration_ms,
+            max_duration_ms=request.max_duration_ms,
+            min_year=request.min_year,
+            max_year=request.max_year,
+            min_plays=request.min_plays,
+            max_plays=request.max_plays,
+            unheard_only=request.unheard_only,
+            exclude_compilations=request.exclude_compilations,
+            exclude_live=exclude_live,
         )
 
     # How many tracks actually go to AI: the dynamic budget shrinks the pool
@@ -698,6 +874,19 @@ async def preview_filters(request: FilterPreviewRequest) -> FilterPreviewRespons
             pool_size=matching_tracks,
             genres=genres,
             decades=decades,
+            artists=artists,
+            exclude_genres=exclude_genres,
+            exclude_artists=request.exclude_artists,
+            exclude_decades=request.exclude_decades,
+            min_duration_ms=request.min_duration_ms,
+            max_duration_ms=request.max_duration_ms,
+            min_rating=min_rating,
+            min_year=request.min_year,
+            max_year=request.max_year,
+            min_plays=request.min_plays,
+            max_plays=request.max_plays,
+            unheard_only=request.unheard_only,
+            exclude_compilations=request.exclude_compilations,
         )
 
     # Estimate tokens for all 3 API calls based on real-world testing (Feb 2026):
@@ -733,7 +922,189 @@ async def preview_filters(request: FilterPreviewRequest) -> FilterPreviewRespons
         estimated_input_tokens=estimated_input_tokens,
         estimated_output_tokens=estimated_output_tokens,
         estimated_cost=estimated_cost,
+        matching_as_asked=ladder["asked"] if ladder else matching_tracks,
+        relaxed_tiers=ladder["relaxed"] if ladder else [],
+        relaxed_to=ladder["tier"] if ladder and ladder["relaxed"] else "",
+        rating_user=rating_used,
+        rating_error=rating_error,
     )
+
+
+# =============================================================================
+# Spotify Playlist Import Endpoints
+# =============================================================================
+
+
+@app.post("/api/import/spotify/preview", response_model=SpotifyImportPreviewResponse)
+async def preview_spotify_import(request: SpotifyImportPreviewRequest) -> SpotifyImportPreviewResponse:
+    """Match a Spotify playlist against the library without writing anything.
+
+    The rows come fresh from the Spotify API when credentials are configured, else
+    from the local parquet dump; the cache join-key table answers the match (or
+    live Plex search when the cache is empty). ``match_kind`` per matched row
+    says which rung landed it (exact song key, another version of the same song,
+    or artist-free via the album), and every row the library cannot play is in
+    ``missing`` so the same request can be replayed as an actual import.
+    """
+    config = get_config()
+    try:
+        payload = await asyncio.to_thread(fetch_playlist, request.playlist_ref, config)
+    except SpotifyImportError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    if library_cache.has_cached_tracks():
+        matched, missing = await asyncio.to_thread(match_cached, payload["tracks"])
+    else:
+        plex_client = get_plex_client()
+        if not plex_client or not plex_client.is_connected():
+            raise HTTPException(status_code=503, detail="Plex not connected")
+        matched, missing = await asyncio.to_thread(match_live, payload["tracks"], plex_client)
+
+    return SpotifyImportPreviewResponse(
+        playlist_name=payload["name"],
+        playlist_owner=payload["owner"],
+        spotify_playlist_url=payload["playlist_url"],
+        source=payload["source"],
+        total_tracks=len(payload["tracks"]),
+        matched=[SpotifyMatchedTrack(**m) for m in matched],
+        missing=[SpotifyMissingSong(**m, playlist_ref=payload["playlist_id"], playlist_name=payload["name"]) for m in missing],
+        warnings=payload["warnings"],
+    )
+
+
+@app.post("/api/import/spotify", response_model=SpotifyImportResponse)
+async def import_spotify_playlist(request: SpotifyImportRequest) -> SpotifyImportResponse:
+    """Import a Spotify playlist as a Plex playlist of what the library can play.
+
+    Matched rows become the Plex playlist (deduped, in playlist order); songs the
+    library lacks are written to the cache's ``missing_songs`` wish list
+    (replacing that playlist's previous wish) so they can be gotten later. The
+    history row carries the full preview as its snapshot, so re-running this
+    import re-resolves rather than guessing from stored data.
+    """
+    plex_client = get_plex_client()
+    if not plex_client or not plex_client.is_connected():
+        raise HTTPException(status_code=503, detail="Plex not connected")
+
+    config = get_config()
+    try:
+        payload = await asyncio.to_thread(fetch_playlist, request.playlist_ref, config)
+    except SpotifyImportError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    if library_cache.has_cached_tracks():
+        matched, missing = await asyncio.to_thread(match_cached, payload["tracks"])
+    else:
+        matched, missing = await asyncio.to_thread(match_live, payload["tracks"], plex_client)
+
+    # Playlist order, first copy wins: a playlist can list the same song twice.
+    rating_keys: list[str] = []
+    seen_keys: set[str] = set()
+    for row in matched:
+        key = row["rating_key"]
+        if key not in seen_keys:
+            seen_keys.add(key)
+            rating_keys.append(key)
+
+    # Always called, even with nothing missing: re-importing a fully matched
+    # playlist clears the wish it left on an earlier run.
+    missing_recorded = await asyncio.to_thread(
+        library_cache.record_missing_songs, payload["playlist_id"], payload["name"], missing
+    )
+
+    playlist_name = (request.name or payload["name"] or f"Spotify playlist {payload['playlist_id']}").strip()
+
+    # Save the history row before Plex-side work so the playlist can link to it
+    # (same pattern the generation flow uses), and so "nothing matched" still
+    # leaves an auditable record beside the wish list it wrote.
+    result_id = await asyncio.to_thread(
+        library_cache.save_result,
+        "spotify_import",
+        playlist_name,
+        payload["playlist_url"] or request.playlist_ref,
+        {
+            "playlist_name": payload["name"],
+            "playlist_owner": payload["owner"],
+            "spotify_playlist_url": payload["playlist_url"],
+            "source": payload["source"],
+            "total_tracks": len(payload["tracks"]),
+            "matched": matched,
+            "missing": missing,
+        },
+        len(rating_keys),
+    )
+
+    if not rating_keys:
+        # No empty Plex playlist: the wish list above is the whole result.
+        return SpotifyImportResponse(
+            success=False,
+            error="Nothing in the Spotify playlist matched the library; songs recorded on the wish list",
+            playlist_name=playlist_name,
+            playlist_owner=payload["owner"],
+            spotify_playlist_url=payload["playlist_url"],
+            source=payload["source"],
+            total_tracks=len(payload["tracks"]),
+            matched=[],
+            missing=[SpotifyMissingSong(**m, playlist_ref=payload["playlist_id"], playlist_name=payload["name"]) for m in missing],
+            matched_count=0,
+            missing_count=len(missing),
+            missing_recorded=missing_recorded,
+            result_id=result_id,
+            warnings=payload["warnings"],
+        )
+
+    save = await asyncio.to_thread(
+        plex_client.create_playlist,
+        playlist_name,
+        rating_keys,
+        request.description,
+        request.user,
+        request.copy_to,
+    )
+
+    if save.get("success") and save.get("playlist_id"):
+        # Mirror /api/playlist: point the history row at the Plex playlist.
+        await asyncio.to_thread(
+            library_cache.link_result_playlist,
+            result_id,
+            save["playlist_id"],
+            playlist_name,
+            save.get("owner") or "",
+            save.get("playlist_url") or "",
+        )
+
+    return SpotifyImportResponse(
+        success=bool(save.get("success")),
+        error=save.get("error"),
+        playlist_name=playlist_name,
+        playlist_owner=payload["owner"],
+        spotify_playlist_url=payload["playlist_url"],
+        source=payload["source"],
+        total_tracks=len(payload["tracks"]),
+        matched=[SpotifyMatchedTrack(**m) for m in matched],
+        missing=[SpotifyMissingSong(**m, playlist_ref=payload["playlist_id"], playlist_name=payload["name"]) for m in missing],
+        matched_count=len(rating_keys),
+        missing_count=len(missing),
+        missing_recorded=missing_recorded,
+        result_id=result_id,
+        playlist_id=save.get("playlist_id"),
+        playlist_url=save.get("playlist_url"),
+        tracks_added=save.get("tracks_added"),
+        tracks_skipped=save.get("tracks_skipped"),
+        owner=save.get("owner"),
+        copies=[PlexPlaylistCopy(**c) for c in save.get("copies") or []],
+        warnings=payload["warnings"],
+    )
+
+
+@app.get("/api/import/spotify/missing", response_model=SpotifyMissingListResponse)
+async def get_spotify_wish_list(
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> SpotifyMissingListResponse:
+    """The wish list: songs imported Spotify playlists asked for but lack."""
+    payload = await asyncio.to_thread(library_cache.list_missing_songs, limit, offset)
+    return SpotifyMissingListResponse(**payload)
 
 
 # =============================================================================
@@ -772,10 +1143,24 @@ async def generate_playlist_sse(request: GenerateRequest) -> StreamingResponse:
             refinement_answers=request.refinement_answers,
             genres=request.genres,
             decades=request.decades,
+            artists=request.artists,
+            exclude_genres=request.exclude_genres,
+            exclude_artists=request.exclude_artists,
+            exclude_decades=request.exclude_decades,
             track_count=request.track_count,
             exclude_live=request.exclude_live,
             min_rating=request.min_rating,
+            min_duration_ms=request.min_duration_ms,
+            max_duration_ms=request.max_duration_ms,
+            min_year=request.min_year,
+            max_year=request.max_year,
+            min_plays=request.min_plays,
+            max_plays=request.max_plays,
+            unheard_only=request.unheard_only,
+            exclude_compilations=request.exclude_compilations,
             max_tracks_to_ai=request.max_tracks_to_ai,
+            style_cues=request.style_cues,
+            rating_user=request.rating_user,
         )
 
     return StreamingResponse(
@@ -796,7 +1181,7 @@ async def generate_playlist_sse(request: GenerateRequest) -> StreamingResponse:
 
 @app.post("/api/playlist", response_model=SavePlaylistResponse)
 async def save_playlist(request: SavePlaylistRequest) -> SavePlaylistResponse:
-    """Save a playlist to Plex."""
+    """Save a playlist to Plex (optionally owned by another Plex user)."""
     plex_client = get_plex_client()
     if not plex_client or not plex_client.is_connected():
         raise HTTPException(status_code=503, detail="Plex not connected")
@@ -806,8 +1191,25 @@ async def save_playlist(request: SavePlaylistRequest) -> SavePlaylistResponse:
         request.name,
         request.rating_keys,
         request.description,
+        request.user,
+        request.copy_to,
     )
-    return SavePlaylistResponse(**result)
+
+    # Point the originating history row at the Plex playlist it just produced, so
+    # the history feed shows which Plex playlist this generation became.
+    response = SavePlaylistResponse(**result)
+    if request.result_id and response.success and response.playlist_id:
+        linked = await asyncio.to_thread(
+            library_cache.link_result_playlist,
+            request.result_id,
+            response.playlist_id,
+            request.name,
+            response.owner or "",
+            response.playlist_url or "",
+        )
+        if linked:
+            response.linked_result_id = request.result_id
+    return response
 
 
 # =============================================================================
@@ -848,13 +1250,23 @@ async def create_play_queue(request: PlayQueueRequest) -> PlayQueueResponse:
 
 
 @app.get("/api/plex/playlists", response_model=list[PlexPlaylistInfo])
-async def get_plex_playlists() -> list[PlexPlaylistInfo]:
-    """List audio playlists on the Plex server."""
+async def get_plex_playlists(user: str = OWNER_USER_KEY) -> list[PlexPlaylistInfo]:
+    """List audio playlists for a Plex user (defaults to the connected account)."""
     plex_client = get_plex_client()
     if not plex_client or not plex_client.is_connected():
         raise HTTPException(status_code=503, detail="Plex not connected")
 
-    return await asyncio.to_thread(plex_client.get_playlists)
+    return await asyncio.to_thread(plex_client.get_playlists, user)
+
+
+@app.get("/api/plex/users", response_model=list[PlexUserInfo])
+async def get_plex_users() -> list[PlexUserInfo]:
+    """List Plex accounts that can own playlists on this server."""
+    plex_client = get_plex_client()
+    if not plex_client or not plex_client.is_connected():
+        raise HTTPException(status_code=503, detail="Plex not connected")
+
+    return await asyncio.to_thread(plex_client.get_users)
 
 
 @app.post("/api/playlist/update", response_model=UpdatePlaylistResponse)
@@ -870,6 +1282,7 @@ async def update_playlist(request: UpdatePlaylistRequest) -> UpdatePlaylistRespo
         request.rating_keys,
         request.mode,
         request.description,
+        request.user,
     )
 
     if not result.get("success"):
@@ -1036,6 +1449,8 @@ async def recommend_analyze_prompt(request: AnalyzePromptFiltersRequest) -> Anal
         return AnalyzePromptFiltersResponse(
             genres=result["genres"],
             decades=result["decades"],
+            matched_hints=result.get("matched_hints", []),
+            excluded_genres=result.get("excluded_genres", []),
             reasoning=result["reasoning"],
         )
     except Exception:
@@ -1515,7 +1930,9 @@ async def recommend_generate(request: RecommendGenerateRequest, raw_request: Req
 # =============================================================================
 
 
-_VALID_RESULT_TYPES = {"prompt_playlist", "seed_playlist", "album_recommendation"}
+# "spotify_import" rows come from POST /api/import/spotify: their history card
+# carries the wish list in the snapshot, and the playlist itself is Plex-side.
+_VALID_RESULT_TYPES = {"prompt_playlist", "seed_playlist", "album_recommendation", "spotify_import"}
 
 
 @app.get("/api/results", response_model=ResultListResponse)

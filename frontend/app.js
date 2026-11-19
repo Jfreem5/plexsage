@@ -66,9 +66,15 @@ const focusManager = {
 // State Management
 // =============================================================================
 
+// Playlist ownership: which Plex account a saved playlist belongs to.
+// OWNER_USER_KEY is the backend placeholder for the account PLEX_TOKEN belongs to.
+const OWNER_USER_KEY = '__owner__';
+const OWNERSHIP_AS_USER = 'as_user';       // write the playlist inside the picked user's account
+const OWNERSHIP_COPY_TO = 'copy_to_user';  // write ours, then copy it into the picked user's account
+
 const state = {
     // Current view and mode
-    view: 'home', // 'home' | 'create' | 'recommend' | 'settings'
+    view: 'home', // 'home' | 'create' | 'recommend' | 'import' | 'settings'
     mode: 'prompt', // 'prompt' | 'seed'
     step: 'input',  // 'input' | 'refine' | 'dimensions' | 'filters' | 'results'
 
@@ -96,12 +102,14 @@ const state = {
     excludeLive: true,
     maxTracksToAI: 500,  // 0 = no limit
     minRating: 0,  // 0 = any, 2/4/6/8 = 1/2/3/4 stars minimum
+    ratingUser: OWNER_USER_KEY,  // Whose ratings the rating filters read ('' = the admin account)
 
     // Results
     playlist: [],
     playlistName: '',
     tokenCount: 0,
     estimatedCost: 0,
+    resultId: null,           // Saved-result id of the current playlist (links to Plex)
 
     // Curator narrative
     playlistTitle: '',      // Generated title with date
@@ -121,7 +129,10 @@ const state = {
     config: null,
 
     // Cached filter preview (for local cost recalculation)
-    lastFilterPreview: null,  // { matching_tracks, tracks_to_send }
+    lastFilterPreview: null,  // { matching_tracks, tracks_to_send, relaxed_tiers }
+
+    // Which filters the cache had to widen on the last generation (null = none)
+    lastRelaxation: null,     // { tiers: [...], asked: N }
 
     // Results UX — selection
     selectedTrackKey: null,    // Currently selected track in detail panel
@@ -133,7 +144,13 @@ const state = {
     // Instant Queue (005) — Update Existing
     saveMode: 'new',           // 'new' | 'replace' | 'append'
     selectedPlaylistId: null,
-    plexPlaylists: [],         // Cached after first fetch (FR-017)
+    plexPlaylists: [],         // Cached after first fetch (FR-017), per selected account
+
+    // Which Plex account playlists are written to ('__owner__' = our own account)
+    plexUsers: [],             // Owner first, then other accounts shared with this server
+    plexUsersLoaded: false,
+    plexUser: OWNER_USER_KEY,
+    playlistOwnership: OWNERSHIP_AS_USER,  // 'as_user' | 'copy_to_user'
 
     // Recommendation (006)
     rec: {
@@ -155,6 +172,19 @@ const state = {
         maxAlbumsToAI: 2500,
         loading: false,
         filterAnalysisPromise: null,
+    },
+
+    // Spotify playlist import (007) — paste → match → Plex playlist, plus the
+    // wish list the imports leave behind
+    imp: {
+        step: 'input',        // 'input' | 'preview' | 'results' | 'wishlist'
+        ref: '',              // the Spotify reference as pasted
+        name: '',             // optional Plex playlist name
+        preview: null,        // last SpotifyImportPreviewResponse
+        result: null,         // last SpotifyImportResponse
+        wish: null,           // last SpotifyMissingListResponse page
+        offset: 0,            // first row of the wish-list page shown
+        loading: false,
     },
 
     // Setup wizard
@@ -472,10 +502,17 @@ function generatePlaylistStream(request, onProgress, onComplete, onError) {
     });
 }
 
-async function savePlaylist(name, ratingKeys, description = '') {
+async function savePlaylist(name, ratingKeys, description = '', user = OWNER_USER_KEY, copyTo = [], resultId = null) {
     return apiCall('/playlist', {
         method: 'POST',
-        body: JSON.stringify({ name, rating_keys: ratingKeys, description }),
+        body: JSON.stringify({
+            name,
+            rating_keys: ratingKeys,
+            description,
+            user,
+            copy_to: copyTo,
+            result_id: resultId || null,
+        }),
     });
 }
 
@@ -494,11 +531,15 @@ async function createPlayQueue(ratingKeys, clientId, mode) {
     });
 }
 
-async function fetchPlexPlaylists() {
-    return apiCall('/plex/playlists');
+async function fetchPlexPlaylists(user = OWNER_USER_KEY) {
+    return apiCall(`/plex/playlists?user=${encodeURIComponent(user)}`);
 }
 
-async function sendPlaylistUpdate(playlistId, ratingKeys, mode, description = '') {
+async function fetchPlexUsers() {
+    return apiCall('/plex/users');
+}
+
+async function sendPlaylistUpdate(playlistId, ratingKeys, mode, description = '', user = OWNER_USER_KEY) {
     return apiCall('/playlist/update', {
         method: 'POST',
         body: JSON.stringify({
@@ -506,8 +547,186 @@ async function sendPlaylistUpdate(playlistId, ratingKeys, mode, description = ''
             rating_keys: ratingKeys,
             mode,
             description,
+            user,
         }),
     });
+}
+
+// =============================================================================
+// Playlist Users (which Plex account a saved playlist belongs to)
+// =============================================================================
+
+function loadPlaylistUsers() {
+    if (state.plexUsersLoaded) return;
+
+    fetchPlexUsers()
+        .then(users => {
+            state.plexUsersLoaded = true;
+            state.plexUsers = Array.isArray(users) ? users : [];
+
+            // A stored selection can outlive access to that account (a share being
+            // removed, the server token changing), in which case we fall back to our own.
+            if (!state.plexUsers.some(u => u.key === state.plexUser)) {
+                state.plexUser = OWNER_USER_KEY;
+                try { localStorage.setItem('mediasage-plex-user', state.plexUser); } catch (e) { /* private browsing */ }
+            }
+            // Ratings are read the same way: a stale account falls back to the admin's.
+            if (!state.plexUsers.some(u => u.key === state.ratingUser)) {
+                state.ratingUser = OWNER_USER_KEY;
+                try { localStorage.setItem('mediasage-rating-user', state.ratingUser); } catch (e) { /* private browsing */ }
+            }
+
+            populatePlexUserSelect();
+            populateRatingUserSelect();
+
+            // The picker list belongs to the selected account, so refresh it if we
+            // already loaded the previous one.
+            if (state.plexPlaylists.length) {
+                state.plexPlaylists = [];
+                fetchAndPopulatePlaylists();
+            }
+        })
+        .catch(err => {
+            console.error('Error loading Plex users:', err);
+        });
+}
+
+function populatePlexUserSelect() {
+    const select = document.getElementById('plex-user-select');
+    const container = document.getElementById('plex-user-container');
+    if (!select || !container) return;
+
+    const others = state.plexUsers.filter(u => u.key !== OWNER_USER_KEY);
+    if (others.length === 0) {
+        container.classList.add('hidden');
+        return;
+    }
+
+    select.innerHTML = '';
+
+    for (const user of state.plexUsers) {
+        const option = document.createElement('option');
+        option.value = user.key;
+        option.textContent = user.is_owner ? `${user.title} (me)` : user.title;
+        if (user.key === state.plexUser) option.selected = true;
+        select.appendChild(option);
+    }
+
+    const ownership = document.getElementById('playlist-ownership-select');
+    if (ownership) populateOwnershipSelect();
+
+    container.classList.remove('hidden');
+}
+
+// Rating-whose selector in the filter panel: the admin account first, then the
+// rest of the household, populated from the same roster as the playlist picker.
+function populateRatingUserSelect() {
+    const select = document.getElementById('rating-user-select');
+    if (!select) return;
+
+    select.innerHTML = '';
+    for (const user of state.plexUsers) {
+        const option = document.createElement('option');
+        option.value = user.key;
+        option.textContent = user.is_owner ? `${user.title} (main account)` : user.title;
+        if (user.key === state.ratingUser) option.selected = true;
+        select.appendChild(option);
+    }
+
+    if (!select.children.length) {
+        const fallback = document.createElement('option');
+        fallback.value = OWNER_USER_KEY;
+        fallback.textContent = 'Main account';
+        select.appendChild(fallback);
+    }
+}
+
+// Copying only makes sense for somebody else's account, so the mode choice
+// disappears when our own account is selected.
+function populateOwnershipSelect() {
+    const ownership = document.getElementById('playlist-ownership-select');
+    if (!ownership) return;
+
+    if (state.plexUser === OWNER_USER_KEY) {
+        ownership.classList.add('hidden');
+        return;
+    }
+
+    ownership.innerHTML = '';
+    for (const [value, label] of [
+        [OWNERSHIP_AS_USER, 'They own it'],
+        [OWNERSHIP_COPY_TO, 'Mine + copy to them'],
+    ]) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        if (value === state.playlistOwnership) option.selected = true;
+        ownership.appendChild(option);
+    }
+
+    ownership.classList.remove('hidden');
+}
+
+function onPlexUserChange(event) {
+    state.plexUser = event.target.value || OWNER_USER_KEY;
+    try { localStorage.setItem('mediasage-plex-user', state.plexUser); } catch (e) { /* private browsing */ }
+
+    populateOwnershipSelect();
+    updatePlexUserHint();
+
+    // Playlists are per account: drop the cached list and reload it for the new owner.
+    state.plexPlaylists = [];
+    fetchAndPopulatePlaylists();
+}
+
+function onRatingUserChange(event) {
+    state.ratingUser = event.target.value || OWNER_USER_KEY;
+    try { localStorage.setItem('mediasage-rating-user', state.ratingUser); } catch (e) { /* private browsing */ }
+    updateFilterPreview();
+}
+
+function onOwnershipModeChange(event) {
+    state.playlistOwnership = event.target.value === OWNERSHIP_COPY_TO
+        ? OWNERSHIP_COPY_TO
+        : OWNERSHIP_AS_USER;
+    try { localStorage.setItem('mediasage-playlist-ownership', state.playlistOwnership); } catch (e) { /* private browsing */ }
+    updatePlexUserHint();
+}
+
+function updatePlexUserHint() {
+    const hint = document.getElementById('plex-user-hint');
+    if (!hint) return;
+
+    if (state.plexUser === OWNER_USER_KEY) {
+        hint.classList.add('hidden');
+        return;
+    }
+
+    const selected = state.plexUsers.find(u => u.key === state.plexUser);
+    if (!selected) {
+        hint.classList.add('hidden');
+        return;
+    }
+
+    if (state.playlistOwnership === OWNERSHIP_AS_USER) {
+        hint.textContent = `Created inside ${selected.title}'s account — they can edit or delete it there.`;
+    } else {
+        hint.textContent = `Saved as yours, plus a separate copy in ${selected.title}'s account. Replace and append work on this account's playlists.`;
+    }
+    hint.classList.remove('hidden');
+}
+
+// Maps the current selection onto the backend's two fields, which stay separate:
+// `user` owns the playlist we write, `copy_to` gets its own extra copy.
+function getSaveTarget() {
+    if (state.plexUser !== OWNER_USER_KEY && state.playlistOwnership === OWNERSHIP_COPY_TO) {
+        return { user: OWNER_USER_KEY, copyTo: [state.plexUser] };
+    }
+    return { user: state.plexUser, copyTo: [] };
+}
+
+function getUpdateTarget() {
+    return state.plexUser;
 }
 
 async function fetchLibraryStats() {
@@ -522,6 +741,24 @@ async function triggerLibrarySync() {
     return apiCall('/library/sync', { method: 'POST' });
 }
 
+// Whose stars a rating floor reads lives in its own store, not on the tracks:
+// these two routes are how the UI says what a ★+ filter can actually see.
+async function fetchUserRatingsStatus() {
+    return apiCall('/library/ratings/status');
+}
+
+async function refreshUserRatings(users = []) {
+    return apiCall('/library/ratings/refresh', {
+        method: 'POST',
+        body: JSON.stringify({ users }),
+    });
+}
+
+// The curator's own selection reasons, kept in a DB of their own.
+async function fetchReasoningStatus() {
+    return apiCall('/reasoning/status');
+}
+
 // =============================================================================
 // UI Updates
 // =============================================================================
@@ -531,6 +768,7 @@ const HASH_TO_VIEW = {
     'playlist-prompt': 'create',
     'playlist-seed': 'create',
     'recommend-album': 'recommend',
+    'import-spotify': 'import',
     'settings': 'settings',
     'result': 'result',
     // Backward compat
@@ -545,6 +783,7 @@ const VIEW_TO_HASH = {
     'home': 'home',
     'create': null,  // determined by mode
     'recommend': 'recommend-album',
+    'import': 'import-spotify',
     'settings': 'settings',
 };
 
@@ -587,6 +826,9 @@ function navigateTo(view, mode) {
         if (view === 'recommend' && state.rec.step !== 'prompt') {
             resetRecState();
         }
+        if (view === 'import' && state.imp.step !== 'input') {
+            resetImportState();
+        }
     }
     if (modeChanged) {
         state.step = 'input';
@@ -597,6 +839,8 @@ function navigateTo(view, mode) {
         loadSettings();
     } else if (view === 'recommend') {
         initRecommendView();
+    } else if (view === 'import') {
+        initImportView();
     } else if (view === 'home') {
         renderHistoryFeed();
     }
@@ -635,6 +879,7 @@ async function loadSavedResult(resultId) {
             state.tokenCount = snapshot.token_count || 0;
             state.estimatedCost = snapshot.estimated_cost || 0;
             state.selectedTrackKey = null;
+            state.resultId = data.id;
 
             updateView();
             updateMode();
@@ -722,6 +967,7 @@ function historyIcon(type) {
     const attrs = 'xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
     if (type === 'album_recommendation') return `<svg ${attrs}><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="2"/></svg>`;
     if (type === 'seed_playlist') return `<svg ${attrs}><path d="M14 9.536V7a4 4 0 0 1 4-4h1.5a.5.5 0 0 1 .5.5V5a4 4 0 0 1-4 4 4 4 0 0 0-4 4c0 2 1 3 1 5a5 5 0 0 1-1 3"/><path d="M4 9a5 5 0 0 1 8 4 5 5 0 0 1-8-4"/><path d="M5 21h14"/></svg>`;
+    if (type === 'spotify_import') return `<svg ${attrs}><path d="M21 15v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V15"/><path d="m7 3 5 5 5-5"/><path d="M12 3v10"/></svg>`;
     return `<svg ${attrs}><path d="M12 18V5"/><path d="M15 13a4.17 4.17 0 0 1-3-4 4.17 4.17 0 0 1-3 4"/><path d="M17.598 6.5A3 3 0 1 0 12 5a3 3 0 1 0-5.598 1.5"/><path d="M17.997 5.125a4 4 0 0 1 2.526 5.77"/><path d="M18 18a4 4 0 0 0 2-7.464"/><path d="M19.967 17.483A4 4 0 1 1 12 18a4 4 0 1 1-7.967-.517"/><path d="M6 18a4 4 0 0 1-2-7.464"/><path d="M6.003 5.125a4 4 0 0 0-2.526 5.77"/></svg>`;
 }
 
@@ -729,6 +975,7 @@ function historyIcon(type) {
 function historyIconTitle(type) {
     if (type === 'album_recommendation') return 'Album recommendation';
     if (type === 'seed_playlist') return 'Playlist from seed';
+    if (type === 'spotify_import') return 'Imported from Spotify';
     return 'Playlist from prompt';
 }
 
@@ -809,6 +1056,15 @@ function renderHistoryFeedFromCache() {
         html += `  <div class="history-card-body">`;
         html += `    <div class="history-card-title">${title}${artistSpan}</div>`;
         html += `    <div class="history-card-subtitle">${subtitle}</div>`;
+        if (item.playlist_id) {
+            const playlistLabel = escapeHtml(item.playlist_title || item.title);
+            const owner = item.playlist_owner
+                ? `<span class="history-card-playlist-owner">${escapeHtml(item.playlist_owner)}</span>`
+                : '';
+            html += item.playlist_url
+                ? `    <a class="history-card-playlist" href="${escapeHtml(item.playlist_url)}" target="_blank" rel="noreferrer">Saved in Plex as ${playlistLabel}${owner}</a>`
+                : `    <div class="history-card-playlist">Saved in Plex${owner}</div>`;
+        }
         html += `  </div>`;
         html += `  <span class="history-card-time">${relativeTime(item.created_at)}</span>`;
         html += `  <button class="history-card-delete" aria-label="Delete" title="Delete">&times;</button>`;
@@ -997,6 +1253,7 @@ function updateView() {
     document.querySelectorAll('.nav-btn[data-nav]').forEach(btn => {
         const hash = btn.dataset.nav;
         const isActive = (hash === 'recommend-album' && state.view === 'recommend') ||
+                         (hash === 'import-spotify' && state.view === 'import') ||
                          (hash === 'settings' && state.view === 'settings');
         btn.classList.toggle('active', isActive);
         btn.setAttribute('aria-current', isActive ? 'true' : 'false');
@@ -1380,6 +1637,8 @@ async function updateFilterPreview() {
             max_tracks_to_ai: state.maxTracksToAI,
             min_rating: state.minRating,
             exclude_live: state.excludeLive,
+            // Whose ratings those stars mean; the admin account needs no override.
+            rating_user: state.ratingUser === OWNER_USER_KEY ? undefined : state.ratingUser,
             // Lets the backend size the AI candidate budget from the prompt.
             prompt: state.prompt || undefined,
         };
@@ -1402,9 +1661,13 @@ async function updateFilterPreview() {
         // Clear loading timeout - response arrived fast
         clearTimeout(filterPreviewLoadingTimeout);
 
-        // Cache the matching_tracks for local recalculation
+        // Cache the matching_tracks for local recalculation, plus which tiers the
+        // backend had to widen so the count on screen is the pool a run will use.
         state.lastFilterPreview = {
             matching_tracks: data.matching_tracks,
+            relaxed_tiers: data.relaxed_tiers || [],
+            relaxed_to: data.relaxed_to || '',
+            matching_as_asked: data.matching_as_asked || 0,
         };
 
         // Update display
@@ -1438,6 +1701,14 @@ function updateFilterPreviewDisplay(matchingTracks, tracksToSend, estimatedCost)
         }
     } else {
         trackText = 'Unknown';
+    }
+    // The cache widens filters when they leave fewer candidates than the AI step
+    // wants to choose from; name the tiers so the number above is not read as the
+    // strict answer to the request.
+    const relaxed = state.lastFilterPreview?.relaxed_tiers || [];
+    if (relaxed.length) {
+        const asked = (state.lastFilterPreview?.matching_as_asked ?? 0).toLocaleString();
+        trackText += ` \u00b7 widened from ${asked} as asked: ${relaxed.join(' \u2192 ')}`;
     }
     previewTracks.textContent = trackText;
 
@@ -1507,15 +1778,24 @@ function renderNarrativeBox() {
     const container = document.getElementById('narrative-box');
     if (!container) return;
 
-    if (!state.narrative) {
+    // The cache can widen the filters it was given; say which tiers gave up so the
+    // story below is not read as the strict answer to the request.
+    const note = state.lastRelaxation
+        ? `<p class="narrative-note">Filters widened from ${state.lastRelaxation.asked.toLocaleString()} candidates as asked: ${state.lastRelaxation.tiers.map(escapeHtml).join(' → ')}</p>`
+        : '';
+    if (!state.narrative && !note) {
         container.classList.add('hidden');
         return;
     }
 
     container.classList.remove('hidden');
 
+    const story = state.narrative
+        ? `<p class="narrative-text">${escapeHtml(state.narrative)}</p>`
+        : '';
     container.innerHTML = `
-        <p class="narrative-text">${escapeHtml(state.narrative)}</p>
+        ${story}
+        ${note}
     `;
 
     // Update prompt pill
@@ -1686,6 +1966,10 @@ function updatePlaylist() {
 
     // Update playlist name input
     document.getElementById('playlist-name-input').value = state.playlistName;
+
+    // Playlist ownership picker (loads once, then restores the saved selection)
+    loadPlaylistUsers();
+    updatePlexUserHint();
 }
 
 function updateResultsFooter() {
@@ -2161,12 +2445,32 @@ function hideSuccess() {
     document.getElementById('success-toast').classList.add('hidden');
 }
 
-function showSuccessModal(name, trackCount, playlistUrl) {
+function showSuccessModal(name, trackCount, playlistUrl, response = {}) {
     const modal = document.getElementById('success-modal');
     const summary = document.getElementById('success-modal-summary');
     const openBtn = document.getElementById('open-in-plex-btn');
 
-    summary.textContent = `"${name}" with ${trackCount} track${trackCount !== 1 ? 's' : ''} has been added to your Plex library.`;
+    // The backend always reports which account the playlist lives in, plus one
+    // entry per extra user we were asked to copy it for.
+    const copies = response.copies || [];
+    const copied = copies.filter(c => c.success).map(c => c.user);
+    const failed = copies.filter(c => !c.success).map(c => c.user);
+    const wroteForSomeoneElse = state.plexUser !== OWNER_USER_KEY && !!response.owner;
+
+    let text = `"${name}" with ${trackCount} track${trackCount !== 1 ? 's' : ''}`;
+    text += wroteForSomeoneElse
+        ? ` was created inside ${response.owner}'s Plex account.`
+        : ' has been added to your Plex library.';
+
+    if (copied.length) {
+        text += ` A separate copy was saved for ${copied.join(', ')}.`;
+    }
+    if (failed.length) {
+        text += ` Could not create a copy for ${failed.join(', ')}.`;
+        console.warn('Playlist copy failures:', copies.filter(c => !c.success));
+    }
+
+    summary.textContent = text;
 
     if (playlistUrl) {
         openBtn.href = playlistUrl;
@@ -2206,6 +2510,7 @@ function resetPlaylistState() {
     state.playlistTitle = '';
     state.narrative = '';
     state.trackReasons = {};
+    state.resultId = null;
     state.userRequest = '';
     state.selectedTrackKey = null;
     document.getElementById('prompt-input').value = '';
@@ -2705,6 +3010,9 @@ function setupEventListeners() {
     // Save playlist
     document.getElementById('save-playlist-btn').addEventListener('click', handleSavePlaylist);
 
+    // Re-scan household members' star ratings into the per-account store
+    document.getElementById('rescan-ratings-btn').addEventListener('click', handleRescanRatings);
+
     // Save settings
     document.getElementById('save-settings-btn').addEventListener('click', handleSaveSettings);
 
@@ -2790,6 +3098,13 @@ function setupEventListeners() {
     document.getElementById('playlist-picker').addEventListener('change', (e) => {
         state.selectedPlaylistId = e.target.value;
     });
+
+    // Playlist ownership (which Plex account we write to, and who gets a copy)
+    document.getElementById('plex-user-select').addEventListener('change', onPlexUserChange);
+    document.getElementById('playlist-ownership-select').addEventListener('change', onOwnershipModeChange);
+
+    // Whose ratings the rating filters read
+    document.getElementById('rating-user-select').addEventListener('change', onRatingUserChange);
 
     // Update success modal — Start New Playlist
     document.getElementById('update-new-playlist-btn').addEventListener('click', handleUpdateSuccessNewPlaylist);
@@ -3068,6 +3383,10 @@ async function handleGenerate() {
         exclude_live: state.excludeLive,
         min_rating: state.minRating,
         max_tracks_to_ai: state.maxTracksToAI,
+        // Whose stars that floor reads: the preview counted in this same account,
+        // and a member's ratings exist only in the local cache, so the run has to
+        // name it too or its candidate set is not the one the preview counted.
+        rating_user: state.ratingUser === OWNER_USER_KEY ? undefined : state.ratingUser,
     };
 
     if (state.mode === 'prompt') {
@@ -3109,6 +3428,13 @@ async function handleGenerate() {
             state.sessionTokens += response.token_count || 0;
             state.sessionCost += response.estimated_cost || 0;
 
+            // Which filters the cache could not honour: the pool was widened tier by
+            // tier from ``matching_as_asked`` candidates up to the size the candidate
+            // budget wanted. Empty means the run honoured every filter as asked.
+            state.lastRelaxation = response.relaxed_tiers?.length
+                ? { tiers: response.relaxed_tiers, asked: response.matching_as_asked || 0 }
+                : null;
+
             state.playlist = response.tracks;
             state.tokenCount = state.sessionTokens;
             state.estimatedCost = state.sessionCost;
@@ -3138,6 +3464,7 @@ async function handleGenerate() {
 
             // Update URL to deep link for this result
             if (response.result_id) {
+                state.resultId = response.result_id;
                 history.replaceState(null, '', `#result/${response.result_id}`);
                 markHistoryStale();
             }
@@ -3188,13 +3515,25 @@ async function handleSavePlaylist() {
 
     try {
         const ratingKeys = state.playlist.map(t => t.rating_key);
-        const response = await savePlaylist(name, ratingKeys, state.narrative);
+        const target = getSaveTarget();
+        const response = await savePlaylist(
+            name,
+            ratingKeys,
+            state.narrative,
+            target.user,
+            target.copyTo,
+            state.resultId
+        );
 
         if (response.success) {
             const trackCount = response.tracks_added || state.playlist.length;
-            showSuccessModal(name, trackCount, response.playlist_url);
+            showSuccessModal(name, trackCount, response.playlist_url, response);
             // Invalidate playlist cache so newly created playlist shows in Update Existing picker
             state.plexPlaylists = [];
+            // A linked history row now shows a Plex badge, so refresh the feed
+            if (response.linked_result_id) {
+                markHistoryStale();
+            }
         } else {
             showError(response.error || 'Failed to save playlist');
         }
@@ -3242,8 +3581,102 @@ async function loadSettings() {
                 // Ignore library stats errors
             }
         }
+
+        // The two local stores a rating floor and the curator prompt depend on.
+        // Neither needs Plex, so this is not guarded on plex_connected.
+        try {
+            await renderRatingsAndMemorySection();
+        } catch {
+            // Nothing stored yet: the filter chips stay as they are.
+        }
     } catch (error) {
         showError('Failed to load settings: ' + error.message);
+    }
+}
+
+async function renderRatingsAndMemorySection() {
+    const section = document.getElementById('memory-stats-section');
+    if (!section) return;
+
+    const [ratings, reasoning] = await Promise.all([
+        fetchUserRatingsStatus(),
+        fetchReasoningStatus(),
+    ]);
+
+    section.style.display = 'block';
+
+    const scanned = ratings.users || [];
+    const scannedKeys = new Set(ratings.synced_users || scanned.map(u => u.user_key));
+
+    const ratingLines = scanned.map((user) => `
+        <p>${escapeHtml(user.user_key)} — ${(user.rated_count || 0).toLocaleString()} rated of
+        ${(user.total_seen || 0).toLocaleString()} · scanned ${formatRelativeTime(user.last_sync_at)}</p>
+    `);
+
+    // A ★+ filter can only read an account whose stars are in the cache; an
+    // unscanned member silently falls back to the main account's column.
+    const asking = state.ratingUser && state.ratingUser !== OWNER_USER_KEY ? state.ratingUser : '';
+    if (asking && !scannedKeys.has(asking)) {
+        ratingLines.push(`
+            <p class="memory-warning">Filtering by ${escapeHtml(asking)}'s stars, which were never
+            scanned — a ★+ floor is reading the main account's instead.</p>
+        `);
+    } else if (asking) {
+        ratingLines.push(`
+            <p>Filtering by ${escapeHtml(asking)}'s stars; tracks they never rated fall back
+            to the main account's.</p>
+        `);
+    } else {
+        ratingLines.push('<p>Filtering by the main account’s stars, which sync with the library.</p>');
+    }
+
+    document.getElementById('memory-ratings').innerHTML = ratingLines.join('');
+
+    const memoryLines = [
+        `
+            <p><strong>Runs:</strong> ${(reasoning.runs || 0).toLocaleString()}
+            · <strong>reasons:</strong> ${(reasoning.selections || 0).toLocaleString()}
+            on ${(reasoning.tracks_with_reasons || 0).toLocaleString()} tracks
+            (${(reasoning.tagged_tracks || 0).toLocaleString()} tagged)</p>
+        `,
+        `<p><strong>Last run:</strong> ${formatRelativeTime(reasoning.last_run_at)}</p>`,
+    ];
+    const vocabulary = (reasoning.tags || []).slice(0, 12).map((entry) => escapeHtml(entry.tag));
+    if (vocabulary.length) {
+        memoryLines.push(`<p><strong>Tags the curator used:</strong> ${vocabulary.join(', ')}</p>`);
+    }
+    if (reasoning.error) {
+        memoryLines.push(`<p class="memory-warning">${escapeHtml(reasoning.error)}</p>`);
+    }
+
+    document.getElementById('memory-reasoning').innerHTML = memoryLines.join('');
+}
+
+async function handleRescanRatings() {
+    try {
+        // Every Plex account but the main one: the admin's stars already are the
+        // tracks' own user_rating column, so rescanning that account rewrites
+        // nothing. A household member never scanned is the reason a ★+ floor
+        // silently reads the admin's stars instead of theirs.
+        const roster = await fetchPlexUsers();
+        const targets = roster.filter((u) => u.key !== OWNER_USER_KEY).map((u) => u.key);
+
+        const response = await refreshUserRatings(targets);
+        // The panel now lists the accounts whose stars a rating floor can read.
+        await renderRatingsAndMemorySection();
+
+        const refreshed = response.refreshed || [];
+        const failed = Object.keys(response.errors || {});
+        if (failed.length) {
+            showError(
+                `Scanned ${refreshed.length} account(s), failed ${failed.length}: ` +
+                `${failed.join(', ')}`
+            );
+        } else {
+            showSuccess(`Scanned star ratings for ${refreshed.length} Plex account(s)`);
+        }
+    } catch (error) {
+        showError('Failed to rescan ratings: ' + error.message);
     }
 }
 
@@ -3561,7 +3994,7 @@ async function fetchAndPopulatePlaylists() {
         picker.innerHTML = '<option value="" disabled>Loading playlists...</option>';
 
         try {
-            state.plexPlaylists = await fetchPlexPlaylists();
+            state.plexPlaylists = await fetchPlexPlaylists(state.plexUser);
         } catch (error) {
             showError('Failed to load playlists: ' + error.message);
             picker.innerHTML = '<option value="__scratch__">MediaSage - Now Playing</option>';
@@ -3659,6 +4092,7 @@ async function handleUpdatePlaylist() {
             ratingKeys,
             state.saveMode,
             state.narrative,
+            getUpdateTarget(),
         );
 
         setLoading(false);
@@ -3672,6 +4106,12 @@ async function handleUpdatePlaylist() {
                 }
             } else {
                 message = `Updated ${playlistTitle} — Replaced with ${response.tracks_added} tracks`;
+            }
+
+            // The backend always names the owning account; only say something when
+            // it is not the one we normally use.
+            if (state.plexUser !== OWNER_USER_KEY && response.owner) {
+                message += ` (inside ${response.owner}'s account)`;
             }
 
             if (response.warning) {
@@ -4519,11 +4959,359 @@ async function handleRecGenerate() {
 }
 
 // =============================================================================
+// Spotify Playlist Import View (007)
+// =============================================================================
+
+/** Rows painted per list before the rest is summarised ("+ 412 more") */
+const IMPORT_ROW_LIMIT = 60;
+/** Wish-list rows fetched per page (the API caps a page at 1000) */
+const IMPORT_WISH_PAGE = 50;
+
+/** The paste → match → playlist bar; the wish list sits outside it */
+const IMPORT_STEPS = ['input', 'preview', 'results'];
+
+function updateImportStep() {
+    const isWishList = state.imp.step === 'wishlist';
+    const currentIndex = IMPORT_STEPS.indexOf(state.imp.step);
+
+    // The wish list is not a step of the flow, so it hides the progress bar
+    const bar = document.getElementById('imp-steps');
+    if (bar) bar.style.display = isWishList ? 'none' : '';
+
+    document.querySelectorAll('.imp-panel').forEach(panel => {
+        const panelStep = panel.id.replace('imp-step-', '');
+        panel.classList.toggle('active', panelStep === state.imp.step);
+    });
+
+    if (!bar) return;
+    bar.querySelectorAll('.step').forEach(stepEl => {
+        const stepName = stepEl.dataset.step;
+        stepEl.classList.toggle('active', stepName === state.imp.step);
+        stepEl.classList.toggle('completed', currentIndex > 0 && IMPORT_STEPS.indexOf(stepName) < currentIndex);
+    });
+    bar.querySelectorAll('.step-connector').forEach((connector, i) => {
+        connector.classList.toggle('completed', i < currentIndex);
+    });
+}
+
+function setImportStep(step) {
+    state.imp.step = step;
+    updateImportStep();
+}
+
+function resetImportState() {
+    state.imp.step = 'input';
+    state.imp.ref = '';
+    state.imp.name = '';
+    state.imp.preview = null;
+    state.imp.result = null;
+    state.imp.wish = null;
+    state.imp.offset = 0;
+    state.imp.loading = false;
+    updateImportStep();
+}
+
+/** M:SS for a row's duration ("" when the row carries none) */
+function importDurationText(durationMs) {
+    const seconds = Math.round((durationMs || 0) / 1000);
+    if (seconds <= 0) return '';
+    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+/** One song line: position, title (linked when Spotify names it), artist, album */
+function importRowHtml(row, index) {
+    const kind = ['exact', 'version', 'album', 'search'].includes(row.match_kind)
+        ? row.match_kind : '';
+    const url = /^https:\/\/open\.spotify\.com\/[A-Za-z0-9?=%._/-]+$/.test(row.spotify_url || '')
+        ? row.spotify_url : '';
+    const song = url
+        ? `<a class="spotify-row-link" href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(row.title || '')}</a>`
+        : `<span class="spotify-row-title">${escapeHtml(row.title || '')}</span>`;
+    const duration = importDurationText(row.duration_ms);
+    return `<div class="spotify-song-row">
+        <span class="spotify-row-position">${row.position || index + 1}</span>
+        ${song}
+        <span class="spotify-row-artist">${escapeHtml(row.artist || '')}</span>
+        ${row.album ? `<span class="spotify-row-album">${escapeHtml(row.album)}</span>` : ''}
+        ${duration ? `<span class="spotify-row-duration">${duration}</span>` : ''}
+        ${kind ? `<span class="spotify-row-tag--${kind}">${kind}</span>` : ''}
+    </div>`;
+}
+
+/** Paint a song list, summarising whatever past the limit */
+function importListHtml(rows, emptyText) {
+    if (!rows.length) {
+        return `<div class="spotify-song-row--empty">${escapeHtml(emptyText)}</div>`;
+    }
+    const shown = rows.slice(0, IMPORT_ROW_LIMIT).map((row, i) => importRowHtml(row, i)).join('');
+    const rest = rows.length - IMPORT_ROW_LIMIT;
+    return rest > 0
+        ? shown + `<div class="spotify-song-row--empty">+ ${rest} more</div>`
+        : shown;
+}
+
+/** Match/preview panel: which playlist was read, and what answered */
+function renderImportPreview() {
+    const summary = document.getElementById('imp-preview-summary');
+    const matchedList = document.getElementById('imp-preview-matched');
+    const missingList = document.getElementById('imp-preview-missing');
+    const warningBox = document.getElementById('imp-preview-warnings');
+    if (!summary || !matchedList || !missingList) return;
+
+    const preview = state.imp.preview || {};
+    const matched = preview.matched || [];
+    const missing = preview.missing || [];
+
+    summary.innerHTML = [
+        `<strong>${escapeHtml(preview.playlist_name || 'Spotify playlist')}</strong>`,
+        preview.playlist_owner
+            ? `<span class="spotify-summary-stat">Spotify owner: ${escapeHtml(preview.playlist_owner)}</span>` : '',
+        `<span class="spotify-summary-stat">${preview.source === 'dump' ? 'from the local snapshot' : 'fresh from Spotify'}</span>`,
+        `<span class="spotify-summary-stat">${preview.total_tracks || 0} songs read</span>`,
+        `<span class="spotify-summary-stat">${matched.length} yours</span>`,
+        `<span class="spotify-summary-stat">${missing.length} missing</span>`,
+    ].join(' ');
+
+    matchedList.innerHTML = importListHtml(matched, 'None of these songs are in your library yet');
+    missingList.innerHTML = importListHtml(missing, 'Your library can play every song on it');
+
+    const warnings = preview.warnings || [];
+    if (warningBox) {
+        warningBox.hidden = warnings.length === 0;
+        warningBox.innerHTML = warnings.map(w => `<p>${escapeHtml(w)}</p>`).join('');
+    }
+
+    // Nothing matched: the wish list is the whole result, so there is no
+    // playlist to create (the route says the same thing when asked).
+    const importBtn = document.getElementById('imp-import-btn');
+    if (importBtn) importBtn.disabled = matched.length === 0;
+}
+
+/** Result panel: what got written to Plex, and what stayed a wish */
+function renderImportResult() {
+    const block = document.getElementById('imp-result');
+    const list = document.getElementById('imp-result-list');
+    if (!block) return;
+
+    const result = state.imp.result || {};
+    const failed = !result.success;
+    block.classList.toggle('spotify-import-result--failed', failed);
+
+    const lines = [];
+    if (failed) {
+        lines.push('Nothing became a Plex playlist.');
+    } else {
+        lines.push(`<strong>${escapeHtml(result.playlist_name || '')}</strong> is now yours on Plex`);
+        if (result.owner) lines.push(`Owned by ${escapeHtml(result.owner)}`);
+        const parts = [];
+        if (result.tracks_added != null) parts.push(`${result.tracks_added} added`);
+        if (result.tracks_skipped) parts.push(`${result.tracks_skipped} already there`);
+        if (parts.length) lines.push(parts.join(', '));
+    }
+    if (result.missing_recorded) {
+        lines.push(`${result.missing_recorded} song(s) kept on the wish list`);
+    } else if (!failed) {
+        lines.push('Nothing new had to be wished for');
+    }
+    if (result.error) lines.push(escapeHtml(result.error));
+    if (result.spotify_playlist_url) {
+        lines.push(`Read from <a class="spotify-row-link" href="${escapeHtml(result.spotify_playlist_url)}" target="_blank" rel="noopener">the Spotify playlist</a>`);
+    }
+    if (result.playlist_url) {
+        lines.push(`Open it in Plex: <a class="spotify-row-link" href="${escapeHtml(result.playlist_url)}" target="_blank" rel="noopener">${escapeHtml(result.playlist_name || 'playlist')}</a>`);
+    }
+    const copies = result.copies || [];
+    if (copies.length) {
+        lines.push(`Copies for other accounts: ${copies.map(c => escapeHtml(c.user)).join(', ')}`);
+    }
+    (result.warnings || []).forEach(w => lines.push(escapeHtml(w)));
+
+    block.innerHTML = lines.map(line => `<div class="spotify-result-line">${line}</div>`).join('');
+
+    const missing = result.missing || [];
+    list.innerHTML = importListHtml(missing, 'Every song on that playlist was yours');
+}
+
+/** Wish list panel: everything imported playlists asked for but lack */
+function renderImportWishList() {
+    const summary = document.getElementById('imp-wishlist-summary');
+    const list = document.getElementById('imp-wishlist-list');
+    const nextBtn = document.getElementById('imp-wishlist-next-btn');
+    if (!summary || !list) return;
+
+    const payload = state.imp.wish || {};
+    const rows = payload.missing || [];
+    const playlists = payload.playlists || [];
+    const total = payload.total || 0;
+    const from = state.imp.offset;
+
+    const heads = playlists.map(p => `<div class="spotify-wishlist-playlist">
+        <span class="spotify-wishlist-playlist-count">${p.count}</span>
+        <span class="spotify-row-title">${escapeHtml(p.playlist_name || p.playlist_ref)}</span>
+    </div>`).join('');
+    summary.innerHTML = total === 0
+        ? `<div class="spotify-wishlist-empty">No wishes yet — imports put the songs they cannot play here.</div>`
+        : `<div class="spotify-wishlist-empty">Showing ${from + 1}&ndash;${from + rows.length} of ${total}. Re-importing refreshes a playlist&rsquo;s part.</div>`
+          + heads;
+
+    list.innerHTML = importListHtml(rows, 'Nothing is missing right now');
+
+    if (nextBtn) nextBtn.disabled = !(rows.length && from + rows.length < total);
+}
+
+async function initImportView() {
+    // #import-spotify/missing opens straight at the wish list, so a bookmark or
+    // the results panel's button does not have to walk through the flow.
+    if (location.hash.slice(1).startsWith('import-spotify/missing')) {
+        state.imp.step = 'wishlist';
+        updateImportStep();
+        await loadImportWishList(0);
+        return;
+    }
+    updateImportStep();
+}
+
+async function loadImportWishList(offset = 0) {
+    try {
+        state.imp.wish = await apiCall(
+            `/import/spotify/missing?limit=${IMPORT_WISH_PAGE}&offset=${offset}`
+        );
+        state.imp.offset = offset;
+        renderImportWishList();
+    } catch (e) {
+        showError(e.message || 'Could not read the wish list');
+    }
+}
+
+async function handleImportPreview() {
+    const refInput = document.getElementById('imp-ref-input');
+    const nameInput = document.getElementById('imp-name-input');
+    const ref = (refInput?.value || '').trim();
+    if (!ref) {
+        showError('Paste a Spotify playlist URL, URI or id first.');
+        return;
+    }
+    state.imp.ref = ref;
+    state.imp.name = (nameInput?.value || '').trim();
+
+    showStepLoading([
+        { id: 'fetching', text: 'Reading the Spotify playlist...', status: 'active' },
+        { id: 'matching', text: 'Matching it against your library...', status: 'pending' },
+    ]);
+    state.imp.loading = true;
+    // A hung Spotify call must not leave the flow stuck (same 120 s the
+    // recommend flow gives a call).
+    const controller = new AbortController();
+    const staleTimer = setTimeout(() => controller.abort(), 120000);
+    try {
+        const preview = await apiCall('/import/spotify/preview', {
+            method: 'POST',
+            signal: controller.signal,
+            body: JSON.stringify({ playlist_ref: ref }),
+        });
+        updateStepProgress('matching');
+        hideStepLoading();
+        state.imp.loading = false;
+        state.imp.preview = preview;
+        renderImportPreview();
+        setImportStep('preview');
+    } catch (e) {
+        hideStepLoading();
+        state.imp.loading = false;
+        if (e.name === 'AbortError') {
+            showError('Spotify did not answer in time. Try again, or import from the local snapshot instead.');
+        } else {
+            showError(e.message || 'Could not read that Spotify playlist');
+        }
+    } finally {
+        clearTimeout(staleTimer);
+    }
+}
+
+async function handleImportRun() {
+    // The route re-resolves the playlist (a preview is a snapshot, not a state
+    // handle), so the import sends the reference rather than the rows.
+    const preview = state.imp.preview;
+    if (!preview || state.imp.loading) return;
+    if (!(preview.matched || []).length) {
+        showError('Nothing matched your library, so there is no playlist to create.');
+        return;
+    }
+    const target = getSaveTarget();
+    // The import re-reads the playlist, so it gets the same timeout as a preview
+    const controller = new AbortController();
+    const staleTimer = setTimeout(() => controller.abort(), 120000);
+    try {
+        showStepLoading([
+            { id: 'reading', text: 'Reading the Spotify playlist...', status: 'active' },
+            { id: 'matching', text: 'Matching it against your library...', status: 'pending' },
+            { id: 'writing', text: 'Writing the Plex playlist...', status: 'pending' },
+        ]);
+        state.imp.loading = true;
+        const result = await apiCall('/import/spotify', {
+            method: 'POST',
+            signal: controller.signal,
+            body: JSON.stringify({
+                playlist_ref: preview.spotify_playlist_url || state.imp.ref,
+                name: state.imp.name,
+                description: '',
+                user: target.user,
+                copy_to: target.copyTo,
+            }),
+        });
+        updateStepProgress('writing');
+        hideStepLoading();
+        state.imp.loading = false;
+        state.imp.result = result;
+        if (result.result_id) markHistoryStale();
+        renderImportResult();
+        setImportStep('results');
+    } catch (e) {
+        hideStepLoading();
+        state.imp.loading = false;
+        if (e.name === 'AbortError') {
+            showError('The import did not finish in time. Try again.');
+        } else {
+            showError(e.message || 'Could not import that playlist');
+        }
+    } finally {
+        clearTimeout(staleTimer);
+    }
+}
+
+function setupImportEventListeners() {
+    document.getElementById('imp-preview-btn')?.addEventListener('click', () => {
+        handleImportPreview();
+    });
+    document.getElementById('imp-import-btn')?.addEventListener('click', () => {
+        handleImportRun();
+    });
+    [
+        document.getElementById('imp-start-over-btn'),
+        document.getElementById('imp-another-btn'),
+        document.getElementById('imp-import-btn-2'),
+    ].forEach(btn => btn?.addEventListener('click', () => {
+        resetImportState();
+    }));
+    document.getElementById('imp-wishlist-btn')?.addEventListener('click', () => {
+        state.imp.step = 'wishlist';
+        updateImportStep();
+        loadImportWishList(0);
+    });
+    document.getElementById('imp-wishlist-next-btn')?.addEventListener('click', () => {
+        const payload = state.imp.wish || {};
+        const rows = payload.missing || [];
+        loadImportWishList(state.imp.offset + rows.length);
+    });
+}
+
+// =============================================================================
 // Step-Based Loading Overlay (shared by playlist + album flows)
 // =============================================================================
 
 /** Playlist generation: maps fine-grained SSE step IDs to consolidated visible steps */
 const PLAYLIST_STEP_MAP = {
+    relaxing: 'preparing',
     fetching: 'preparing',
     filtering: 'preparing',
     preparing: 'preparing',
@@ -5401,6 +6189,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     setupEventListeners();
     setupRecEventListeners();
+    setupImportEventListeners();
     setupHistoryEventListeners();
     state.view = viewFromHash();
     state.mode = modeFromHash();
@@ -5454,6 +6243,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Initialize views AFTER config is loaded
     if (state.view === 'recommend') {
         initRecommendView();
+    } else if (state.view === 'import') {
+        initImportView();
     } else if (state.view === 'home') {
         renderHistoryFeed();
     }
@@ -5466,6 +6257,18 @@ document.addEventListener('DOMContentLoaded', async () => {
             loadSavedResult(resultId);
         }
     }
+
+    // Restore which Plex account playlists are written to (validated once the
+    // account list loads, so a stale key falls back to our own account)
+    try {
+        const savedUser = localStorage.getItem('mediasage-plex-user');
+        if (savedUser) state.plexUser = savedUser;
+
+        const savedOwnership = localStorage.getItem('mediasage-playlist-ownership');
+        if (savedOwnership === OWNERSHIP_COPY_TO || savedOwnership === OWNERSHIP_AS_USER) {
+            state.playlistOwnership = savedOwnership;
+        }
+    } catch (e) { /* private browsing / storage disabled */ }
 
     // Restore save mode from localStorage AFTER config loads (US3 — T017)
     let initialMode = 'new';

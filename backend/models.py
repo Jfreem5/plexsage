@@ -2,7 +2,56 @@
 
 from typing import Literal
 
+import re
+
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+# Sentinel user key meaning "the Plex account MediaSage itself is connected as"
+OWNER_USER_KEY = "__owner__"
+
+# A last-heard window is phrased as a bare ISO date so it lines up with the
+# library cache's ``last_viewed_at`` column, which is an ISO timestamp that the
+# filter compares by whole day ("2026-03-02T07:57:35" → "2026-03-02").
+ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _iso_date_error(value: str, field: str) -> str | None:
+    """Error text when *value* is not a real ``YYYY-MM-DD`` date; "" means unset."""
+    if not value:
+        return None
+    if not ISO_DATE_RE.fullmatch(value):
+        return f"{field} must be an ISO date (YYYY-MM-DD)"
+    month, day = int(value[5:7]), int(value[8:10])
+    if not 1 <= month <= 12 or not 1 <= day <= 31:
+        return f"{field} is not a real calendar date"
+    return None
+
+
+def _familiarity_conflict(filters) -> str | None:
+    """Contradiction message when a request's familiarity facets fight each other.
+
+    Shared by :class:`FilterPreviewRequest` and :class:`GenerateRequest`, which carry
+    the same filter fields. ``live_only`` is deliberately absent here: both filter
+    layers treat it as authoritative over ``exclude_live``, so asking for live rows
+    alongside the default drop-live flag means "keep the live rows", not nothing.
+    """
+    for name in ("played_after", "played_before"):
+        error = _iso_date_error(getattr(filters, name), name)
+        if error:
+            return error
+    if filters.played_after and filters.played_before and filters.played_after > filters.played_before:
+        return "played_after cannot be after played_before"
+    # Never-played tracks have no last-heard date to sit inside a window.
+    if filters.unheard_only and (filters.played_after or filters.played_before):
+        return "unheard_only contradicts a played_after/played_before window"
+    if filters.rated_only and filters.unrated_only:
+        return "rated_only contradicts unrated_only"
+    # An unrated row carries no rating, so it cannot clear a rating floor.
+    if filters.unrated_only and filters.min_rating > 0:
+        return "unrated_only contradicts a min_rating floor"
+    if filters.min_rating and filters.max_rating and filters.min_rating > filters.max_rating:
+        return "min_rating cannot exceed max_rating"
+    return None
 
 
 def album_key(artist: str, album: str, lower: bool = True) -> str:
@@ -44,6 +93,7 @@ class Dimension(BaseModel):
     id: str
     label: str
     description: str
+    category: str = ""  # Descriptor family ("mood", "tempo", "instrumentation", ...)
 
 
 class FilterSet(BaseModel):
@@ -51,8 +101,27 @@ class FilterSet(BaseModel):
 
     genres: list[str] = []
     decades: list[str] = []
+    artists: list[str] = []
+    exclude_genres: list[str] = []
+    exclude_artists: list[str] = []  # "anything but Nickelback" → drop these artists
+    exclude_decades: list[str] = []  # "not the 80s" → drop these decades
+    min_year: int = 0  # 0 = no floor ("recorded in 1977", "released after 2015")
+    max_year: int = 0  # 0 = no ceiling ("before 1980")
+    min_plays: int = 0  # 0 = no floor ("most played", "on repeat")
+    max_plays: int = 0  # 0 = no ceiling ("not the stuff I blast")
+    unheard_only: bool = False  # "hidden gems" → tracks never played
+    exclude_compilations: bool = False  # "studio albums only" → drop Various Artists
     track_count: int = 25
     exclude_live: bool = True
+    min_rating: int = 0
+    min_duration_ms: int = 0
+    max_duration_ms: int = 0
+    live_only: bool = False  # "only live takes" → keep just the live rows
+    rated_only: bool = False  # "music I have rated" → rows carrying a user rating
+    unrated_only: bool = False  # "stuff I never judged" → rows without a user rating
+    max_rating: int = 0  # 0 = no ceiling; "nothing I gave 9s to" caps Plex's 0-10 scale
+    played_after: str = ""  # ISO YYYY-MM-DD last-heard floor ("" = unbounded)
+    played_before: str = ""  # ISO YYYY-MM-DD last-heard ceiling ("" = unbounded)
 
     @field_validator("track_count")
     @classmethod
@@ -107,6 +176,12 @@ class LLMConfig(BaseModel):
     ollama_context_window: int = 32768  # Detected from model, can be overridden
     custom_url: str = ""
     custom_context_window: int = 32768
+    # HTTP behavior for LLM API calls. Local inference servers (LM Studio,
+    # MLX, Ollama) can need many minutes to finish one generation, so raise
+    # the timeout and set max_retries to 0 for them (a retry re-runs the
+    # entire slow generation from scratch).
+    request_timeout: float = 600.0
+    max_retries: int = 2
 
     @field_validator("ollama_context_window", "custom_context_window")
     @classmethod
@@ -124,12 +199,38 @@ class DefaultsConfig(BaseModel):
     track_count: int = 25
 
 
+class SpotifyConfig(BaseModel):
+    """The optional Spotify side of playlist import.
+
+    Two fetch paths, picked by what is configured: with ``client_id``/``client_secret``
+    (a free Spotify for Developers app pair) the playlist comes fresh from
+    api.spotify.com; without them, ``parquet_dir`` points at the one-directory-per-table
+    Annas/Spotify parquet dump, one directory per table, which resolves only the
+    playlists that snapshot captured. An install that configures neither
+    keeps every other route working; the import routes say so instead of guessing.
+    """
+
+    client_id: str = ""
+    client_secret: str = ""
+    parquet_dir: str = ""  # dump level with playlists/playlist_tracks/tracks parts inside
+
+    @field_validator("client_id", "client_secret", "parquet_dir")
+    @classmethod
+    def strip_values(cls, v: str) -> str:
+        return (v or "").strip()
+
+
 class AppConfig(BaseModel):
-    """Root configuration object."""
+    """Root configuration object.
+
+    ``spotify`` is the only optional section: an installation that leaves it empty
+    keeps every existing route and prompt behaving exactly as before.
+    """
 
     plex: PlexConfig
     llm: LLMConfig
     defaults: DefaultsConfig = DefaultsConfig()
+    spotify: SpotifyConfig = SpotifyConfig()
 
 
 # =============================================================================
@@ -151,12 +252,26 @@ class DecadeCount(BaseModel):
     count: int | None = None
 
 
+class ArtistCount(BaseModel):
+    """Artist with track count (the artist roster offered alongside genres/decades)."""
+
+    name: str
+    count: int | None = None
+
+
 class LibraryStatsResponse(BaseModel):
     """Library statistics response."""
 
     total_tracks: int
     genres: list[GenreCount]
     decades: list[DecadeCount]
+
+
+class FilterHint(BaseModel):
+    """One prompt phrase and the library filters it produced."""
+
+    hint: str  # Prompt phrase ("chill", "90s", "shoegaze")
+    matches: list[str] = []  # Library filters it produced; empty when nothing matched
 
 
 class AnalyzePromptRequest(BaseModel):
@@ -166,13 +281,61 @@ class AnalyzePromptRequest(BaseModel):
 
 
 class AnalyzePromptResponse(BaseModel):
-    """Response from prompt analysis."""
+    """Response from prompt analysis.
+
+    Filter suggestions come in two tiers:
+
+    * **Hard filters** (``suggested_*``) can be enforced against library metadata
+      — genres, decades, artists, genre/artist/decade exclusions, a recording-year
+      window, a play-count window (familiarity lives in Plex's ``viewCount``), a
+      last-heard window (Plex's ``lastViewedAt``), an unheard-only flag, a
+      compilation drop, whether live rows stay in the pool, a rated/unrated test,
+      a rating floor and ceiling, and a duration window. They feed
+      :class:`FilterPreviewRequest` and :class:`GenerateRequest`.
+    * **Soft cues** (``style_cues``) are mood/energy/tempo/instrument phrases the
+      library has no column for. They steer the generation prompt instead.
+
+    The ``available_*`` measurements say which of those filters the library can
+    actually answer, so a "heard recently" or "unrated only" suggestion is only
+    made when the library has the rows for it.
+    """
 
     suggested_genres: list[str]
     suggested_decades: list[str]
     available_genres: list[GenreCount]
     available_decades: list[DecadeCount]
+    suggested_artists: list[str] = []  # Library artists named in the prompt
+    suggested_excluded_genres: list[str] = []  # "no synth-pop" → drop these genres
+    suggested_exclude_artists: list[str] = []  # "anything but Nickelback" → drop these artists
+    suggested_exclude_decades: list[str] = []  # "not the 80s" → drop these decades
+    suggested_min_year: int = 0  # 0 = no floor ("recorded in 1977", "last five years")
+    suggested_max_year: int = 0  # 0 = no ceiling ("recorded before 1980")
+    suggested_min_plays: int = 0  # 0 = no floor on Plex's play counter ("most played")
+    suggested_max_plays: int = 0  # 0 = no ceiling ("not the tracks I blast")
+    suggested_unheard_only: bool = False  # "hidden gems" → only never-played tracks
+    suggested_exclude_compilations: bool = False  # "studio albums only" → drop Various Artists
+    suggested_min_rating: int = 0  # 0 = no floor; prompt asked for well-rated music
+    suggested_min_duration_ms: int = 0  # 0 = no floor ("long songs", "epics")
+    suggested_max_duration_ms: int = 0  # 0 = no ceiling ("short songs", "under 3 minutes")
+    suggested_live_only: bool = False  # "only live takes" → keep just the live rows
+    suggested_exclude_live: bool = True  # live rows stay unless "only live" was asked for
+    suggested_rated_only: bool = False  # "music I have rated" → rows carrying a user rating
+    suggested_unrated_only: bool = False  # "stuff I never judged" → rows without a user rating
+    suggested_max_rating: int = 0  # 0 = no ceiling ("nothing I gave 9s to")
+    suggested_played_after: str = ""  # ISO YYYY-MM-DD last-heard floor ("" = unbounded)
+    suggested_played_before: str = ""  # ISO YYYY-MM-DD last-heard ceiling ("" = unbounded)
+    style_cues: list[str] = []  # Soft steering: mood / energy / tempo / instrument phrases
+    available_artists: list[ArtistCount] = []  # Closest library artists (capped sample)
+    available_durations_ms: list[int] = []  # Five-number summary: [shortest, p25, median, p75, longest]
+    available_plays: list[int] = []  # Five-number summary of play counts: [min, p25, median, p75, max]
+    unheard_tracks: int = -1  # Tracks with view_count = 0 in the library (-1 = unknown)
+    year_span: list[int] = []  # [oldest, newest] release years the library holds
+    available_last_played: list[str] = []  # [oldest, newest] last-heard dates ("" = never played)
+    rated_tracks: int = -1  # Tracks carrying a user rating (-1 = unknown)
+    live_tracks: int = -1  # Live recordings the library holds (-1 = unknown)
     reasoning: str
+    matched_hints: list[FilterHint] = []  # Evidence: prompt phrase → filters chosen
+    excluded_genres: list[str] = []  # Library genres considered and left out
     token_count: int = 0
     estimated_cost: float = 0.0
     method: str = "llm"  # "rules", "embeddings", or "llm"
@@ -200,21 +363,107 @@ class FilterPreviewRequest(BaseModel):
 
     genres: list[str] = []
     decades: list[str] = []
+    artists: list[str] = []  # Restrict to these artists (OR matching)
+    exclude_genres: list[str] = []  # Drop tracks carrying these genres
+    exclude_artists: list[str] = []  # Drop these artists ("anything but Nickelback")
+    exclude_decades: list[str] = []  # Drop these decades ("not the 80s")
+    min_year: int = 0  # 0 = no floor ("recorded in 1977", "last five years")
+    max_year: int = 0  # 0 = no ceiling ("before 1980")
+    min_plays: int = 0  # 0 = no floor on Plex's play counter ("most played")
+    max_plays: int = 0  # 0 = no ceiling ("deep cuts, not the rotation")
+    unheard_only: bool = False  # Only tracks never played ("hidden gems")
+    exclude_compilations: bool = False  # Drop Various Artists / compilation rows
     track_count: int = 25
     max_tracks_to_ai: int = 500  # 0 = no limit
     min_rating: int = 0  # 0 = any, 2/4/6/8/10 = minimum rating (Plex uses 0-10)
+    min_duration_ms: int = 0  # 0 = any length
+    max_duration_ms: int = 0  # 0 = no ceiling ("short songs for a run")
+    live_only: bool = False  # "only live takes" → keep just the live rows
+    rated_only: bool = False  # "music I have rated" → rows carrying a user rating
+    unrated_only: bool = False  # "stuff I never judged" → rows without a user rating
+    max_rating: int = 0  # 0 = no ceiling, 2/4/6/8/10 = rating cap (Plex uses 0-10)
+    played_after: str = ""  # ISO YYYY-MM-DD: last heard on/after this date
+    played_before: str = ""  # ISO YYYY-MM-DD: last heard on/before this date
     exclude_live: bool = True
     prompt: str | None = None  # Used to size the dynamic AI track budget
+    # Plex account whose star ratings the rating facets read ("" = the account we
+    # connect with). A household member's stars live on their own connection, so
+    # the first request naming one pays for that scan; tracks they never rated
+    # keep the admin's rating, which is the documented fallback.
+    rating_user: str = ""
+
+    @field_validator("max_duration_ms", "min_duration_ms", "min_year", "max_year")
+    @classmethod
+    def validate_duration_window(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("Duration bounds are milliseconds above zero (0 = unbounded)")
+        return v
+
+    @field_validator("min_plays", "max_plays")
+    @classmethod
+    def validate_play_window(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("Play-count bounds are whole plays above zero (0 = unbounded)")
+        return v
+
+    @field_validator("max_rating")
+    @classmethod
+    def validate_rating_ceiling(cls, v: int) -> int:
+        if v < 0 or v > 10:
+            raise ValueError("max_rating is a Plex rating cap between 0 and 10")
+        return v
+
+    @model_validator(mode="after")
+    def validate_duration_window_order(self) -> "FilterPreviewRequest":
+        if self.min_duration_ms and self.max_duration_ms and self.min_duration_ms > self.max_duration_ms:
+            raise ValueError("min_duration_ms cannot exceed max_duration_ms")
+        if self.min_year and self.max_year and self.min_year > self.max_year:
+            raise ValueError("min_year cannot exceed max_year")
+        if self.min_plays and self.max_plays and self.min_plays > self.max_plays:
+            raise ValueError("min_plays cannot exceed max_plays")
+        if self.unheard_only and self.min_plays > 0:
+            raise ValueError("unheard_only contradicts a min_plays floor")
+        return self
+
+    @model_validator(mode="after")
+    def validate_familiarity_window(self) -> "FilterPreviewRequest":
+        conflict = _familiarity_conflict(self)
+        if conflict:
+            raise ValueError(conflict)
+        return self
+
+    @model_validator(mode="after")
+    def normalize_rating_user(self) -> "FilterPreviewRequest":
+        # The UI reuses the Plex roster's own key for the connecting account, and
+        # the cache's ``user_rating`` column IS that account: "" and ``__owner__``
+        # are the same thing, so normalize to one spelling.
+        if self.rating_user.strip() == OWNER_USER_KEY:
+            self.rating_user = ""
+        return self
 
 
 class FilterPreviewResponse(BaseModel):
     """Response with filter preview stats."""
 
-    matching_tracks: int  # -1 if unknown
+    matching_tracks: int  # -1 if unknown; on the cache branch this is the pool the
+                          # run would actually use, i.e. after filter relaxation
     tracks_to_send: int  # How many will actually be sent to AI
     estimated_input_tokens: int
     estimated_output_tokens: int
     estimated_cost: float
+    # What the filters as asked matched, and which tiers had to give up. The cache
+    # branch widens filters when they leave fewer candidates than the AI budget wants
+    # (:func:`library_cache.relax_filters_for_target`), so the preview and the run
+    # agree on the pool. Defaults keep a response that never relaxed anything valid.
+    matching_as_asked: int = 0  # Candidates the strict filters had (0 = not measured)
+    relaxed_tiers: list[str] = []  # Tiers that changed something, in order
+    relaxed_to: str = ""  # Tier reached ("" = nothing relaxed, e.g. the Plex branch)
+    # Whose ratings the rating facets actually read, and why a requested account
+    # could not be used: a household member's stars need their own connection, and
+    # the live-Plex fallback has none, so a preview may quietly answer in the
+    # admin's stars. "" means the admin account.
+    rating_user: str = ""  # Account used for the rating facets ("" = the admin's)
+    rating_error: str = ""  # Set when the requested account's ratings were not used
 
 
 class SeedTrackInput(BaseModel):
@@ -233,15 +482,84 @@ class GenerateRequest(BaseModel):
     refinement_answers: list[str | None] | None = None
     genres: list[str]
     decades: list[str]
+    artists: list[str] = []  # Restrict to these artists (OR matching)
+    exclude_genres: list[str] = []  # Drop tracks carrying these genres
+    exclude_artists: list[str] = []  # Drop these artists ("anything but Nickelback")
+    exclude_decades: list[str] = []  # Drop these decades ("not the 80s")
+    min_year: int = 0  # 0 = no floor ("recorded in 1977", "last five years")
+    max_year: int = 0  # 0 = no ceiling ("before 1980")
+    min_plays: int = 0  # 0 = no floor on Plex's play counter ("most played")
+    max_plays: int = 0  # 0 = no ceiling ("deep cuts, not the rotation")
+    unheard_only: bool = False  # Only tracks never played ("hidden gems")
+    exclude_compilations: bool = False  # Drop Various Artists / compilation rows
     track_count: int = 25
     exclude_live: bool = True
     min_rating: int = 0  # 0 = any, 2/4/6/8/10 = minimum rating
+    min_duration_ms: int = 0  # 0 = any length
+    max_duration_ms: int = 0  # 0 = no ceiling
+    live_only: bool = False  # "only live takes" → keep just the live rows
+    rated_only: bool = False  # "music I have rated" → rows carrying a user rating
+    unrated_only: bool = False  # "stuff I never judged" → rows without a user rating
+    max_rating: int = 0  # 0 = no ceiling, 2/4/6/8/10 = rating cap (Plex uses 0-10)
+    played_after: str = ""  # ISO YYYY-MM-DD: last heard on/after this date
+    played_before: str = ""  # ISO YYYY-MM-DD: last heard on/before this date
     max_tracks_to_ai: int = 500  # 0 = no limit
+    style_cues: list[str] = []  # Soft steering phrases from prompt analysis (no DB column)
+    # Plex account whose star ratings the rating facets read ("" = the account we
+    # connect with). See :attr:`FilterPreviewRequest.rating_user` for the fallback
+    # rules and the scan this pays for.
+    rating_user: str = ""
+
+    @field_validator("min_duration_ms", "max_duration_ms", "min_year", "max_year")
+    @classmethod
+    def validate_duration_window(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("Duration bounds are milliseconds above zero (0 = unbounded)")
+        return v
+
+    @field_validator("min_plays", "max_plays")
+    @classmethod
+    def validate_play_window(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("Play-count bounds are whole plays above zero (0 = unbounded)")
+        return v
+
+    @field_validator("max_rating")
+    @classmethod
+    def validate_rating_ceiling(cls, v: int) -> int:
+        if v < 0 or v > 10:
+            raise ValueError("max_rating is a Plex rating cap between 0 and 10")
+        return v
+
+    @model_validator(mode="after")
+    def validate_duration_window_order(self) -> "GenerateRequest":
+        if self.min_duration_ms and self.max_duration_ms and self.min_duration_ms > self.max_duration_ms:
+            raise ValueError("min_duration_ms cannot exceed max_duration_ms")
+        if self.min_year and self.max_year and self.min_year > self.max_year:
+            raise ValueError("min_year cannot exceed max_year")
+        if self.min_plays and self.max_plays and self.min_plays > self.max_plays:
+            raise ValueError("min_plays cannot exceed max_plays")
+        if self.unheard_only and self.min_plays > 0:
+            raise ValueError("unheard_only contradicts a min_plays floor")
+        return self
+
+    @model_validator(mode="after")
+    def validate_familiarity_window(self) -> "GenerateRequest":
+        conflict = _familiarity_conflict(self)
+        if conflict:
+            raise ValueError(conflict)
+        return self
 
     @model_validator(mode="after")
     def check_flow(self) -> "GenerateRequest":
         if not self.prompt and not self.seed_track:
             raise ValueError("Either prompt or seed_track must be provided")
+        return self
+
+    @model_validator(mode="after")
+    def normalize_rating_user(self) -> "GenerateRequest":
+        if self.rating_user.strip() == OWNER_USER_KEY:
+            self.rating_user = ""
         return self
 
 
@@ -255,6 +573,17 @@ class GenerateResponse(BaseModel):
     playlist_title: str = ""
     narrative: str = ""
     track_reasons: dict[str, str] = {}
+    # Which filters the cache could not honour: the pool was widened tier by tier
+    # from ``matching_as_asked`` candidates up to the size the candidate budget
+    # wanted (see :func:`library_cache.relax_filters_for_target`). Empty on the
+    # live-Plex branch and whenever the filters already reached the target.
+    matching_as_asked: int = 0
+    relaxed_tiers: list[str] = []
+    relaxed_to: str = ""
+    # Whose stars the rating facets actually filtered by, and why a requested
+    # account could not be used (the live-Plex fallback has no member connection).
+    rating_user: str = ""
+    rating_error: str = ""
 
 
 def _validate_rating_keys(v: list[str]) -> list[str]:
@@ -272,12 +601,88 @@ def _truncate_description(v: str) -> str:
     return v[:2000] if v else v
 
 
+def _validate_result_id(v: str | None) -> str | None:
+    """Normalize an optional history-row id ("" → absent)."""
+    if v is None:
+        return None
+    cleaned = v.strip()
+    if not cleaned:
+        return None
+    if not 8 <= len(cleaned) <= 16 or not all(c in "0123456789abcdef" for c in cleaned):
+        raise ValueError("result_id must be an 8-16 character hex result id")
+    return cleaned
+
+
+class PlexUserInfo(BaseModel):
+    """A Plex account that can own playlists on this server."""
+
+    key: str  # Sent back to the API ('__owner__' or the Plex username/title)
+    title: str  # Display name (home user title, or username for shared friends)
+    user_id: int | None = None
+    is_owner: bool = False
+    is_home: bool = False
+    is_managed: bool = False  # Managed (kids) profiles cannot create their own playlists
+    has_pin: bool = False  # PIN-protected user; an admin can still act for them
+
+
+class PlexPlaylistCopy(BaseModel):
+    """Result of creating a copy of a playlist for an additional user."""
+
+    user: str
+    success: bool
+    playlist_id: str | None = None
+    playlist_url: str | None = None
+    tracks_added: int | None = None
+    tracks_skipped: int | None = None
+    error: str | None = None
+
+
+def _validate_user_keys(v: list[str]) -> list[str]:
+    """Normalize a list of Plex user keys, dropping blanks and duplicates."""
+    seen: list[str] = []
+    for item in v:
+        key = (item or "").strip()
+        if key and key not in seen:
+            seen.append(key)
+    return seen
+
+
 class SavePlaylistRequest(BaseModel):
     """Request to save a playlist to Plex."""
 
     name: str
     rating_keys: list[str]
     description: str = ""  # Playlist description (narrative) saved to Plex
+    user: str = OWNER_USER_KEY  # Owner of the playlist written to Plex
+    copy_to: list[str] = []  # Additional users to receive their own copy (owner key dropped)
+    result_id: str | None = None  # History row to link to the created Plex playlist
+
+    @field_validator("user")
+    @classmethod
+    def normalize_user(cls, v: str) -> str:
+        return (v or "").strip() or OWNER_USER_KEY
+
+    @field_validator("copy_to")
+    @classmethod
+    def validate_copy_to(cls, v: list[str]) -> list[str]:
+        return _validate_user_keys(v)
+
+    @model_validator(mode="after")
+    def drop_redundant_owner_copy(self) -> "SavePlaylistRequest":
+        # The owning account already receives the primary playlist, so a copy aimed
+        # at the same Plex key would write a second identical playlist. Dedupe here
+        # rather than on the Plex side: a Plex connection cannot name its account
+        # (PlexServer.account is a zero-arg method), so plex_client has no reliable
+        # account id to compare. Keys are exact Plex titles, so only an identical
+        # key is recognized — user="__owner__" plus copy_to=["<home user title>"]
+        # still writes two playlists.
+        self.copy_to = [key for key in self.copy_to if key != self.user]
+        return self
+
+    @field_validator("result_id")
+    @classmethod
+    def normalize_result_id(cls, v: str | None) -> str | None:
+        return _validate_result_id(v)
 
     @field_validator("name")
     @classmethod
@@ -306,6 +711,9 @@ class SavePlaylistResponse(BaseModel):
     error: str | None = None
     tracks_added: int | None = None
     tracks_skipped: int | None = None
+    owner: str | None = None  # Display name of the account that owns the playlist
+    copies: list[PlexPlaylistCopy] = []  # Copies created for other Plex users
+    linked_result_id: str | None = None  # History row now pointing at this playlist
 
 
 # =============================================================================
@@ -339,6 +747,12 @@ class UpdatePlaylistRequest(BaseModel):
     rating_keys: list[str]
     mode: Literal["replace", "append"]
     description: str = ""
+    user: str = OWNER_USER_KEY  # Owner of the playlist being updated
+
+    @field_validator("user")
+    @classmethod
+    def normalize_user(cls, v: str) -> str:
+        return (v or "").strip() or OWNER_USER_KEY
 
     @field_validator("description")
     @classmethod
@@ -368,6 +782,7 @@ class UpdatePlaylistResponse(BaseModel):
     playlist_url: str | None = None
     warning: str | None = None
     error: str | None = None
+    owner: str | None = None  # Display name of the account that owns the playlist
 
 
 class PlayQueueRequest(BaseModel):
@@ -460,6 +875,76 @@ class ErrorResponse(BaseModel):
 
     error: str
     detail: str | None = None
+
+
+# =============================================================================
+# Per-Plex-account rating models (whose stars a filter reads)
+# =============================================================================
+
+
+class PlexUserRatingsStatus(BaseModel):
+    """One Plex household account's ratings, as cached locally."""
+
+    user_key: str  # Exact Plex title ('Becky', 'The Boys') or shared username
+    rated_count: int = 0  # Tracks that account rated
+    total_seen: int = 0  # Library size when the scan ran
+    last_sync_at: str | None = None
+
+
+class UserRatingsStatusResponse(BaseModel):
+    """State of the per-account rating store.
+
+    The admin account never appears: its stars are the ``user_rating`` column
+    synced with the library, which is also the fallback for tracks a member
+    never rated.
+    """
+
+    total_tracks: int = 0
+    users: list[PlexUserRatingsStatus] = []
+    synced_users: list[str] = []  # Keys already scanned, so the rest need a scan
+
+
+class RefreshUserRatingsRequest(BaseModel):
+    """Re-scan Plex accounts' ratings into the cache."""
+
+    users: list[str] = []  # Empty = every account already cached
+
+    @field_validator("users")
+    @classmethod
+    def validate_users(cls, v: list[str]) -> list[str]:
+        return _validate_user_keys(v)
+
+
+class RefreshUserRatingsResponse(BaseModel):
+    """Per-account outcome of a rating rescan."""
+
+    refreshed: list[str] = []  # Accounts whose ratings were rewritten
+    errors: dict[str, str] = {}  # Account -> why its scan failed
+    status: UserRatingsStatusResponse
+
+
+# =============================================================================
+# Agent curation memory (data/agent_song_reasoning.db)
+# =============================================================================
+
+
+class ReasoningTagStat(BaseModel):
+    """One mined selection-reason tag with how many tracks carry it."""
+
+    tag: str
+    count: int = 0
+
+
+class ReasoningStatusResponse(BaseModel):
+    """State of the agent's curation memory (the reasoning DB)."""
+
+    runs: int = 0  # Generation runs recorded
+    selections: int = 0  # Stored (track, reason) picks
+    tracks_with_reasons: int = 0  # Distinct tracks with at least one stored reason
+    tagged_tracks: int = 0  # Distinct tracks carrying mined tags
+    tags: list[ReasoningTagStat] = []  # The vocabulary the agent curated with so far
+    last_run_at: str | None = None
+    error: str | None = None
 
 
 # =============================================================================
@@ -687,6 +1172,8 @@ class AnalyzePromptFiltersResponse(BaseModel):
 
     genres: list[str] = []
     decades: list[str] = []
+    matched_hints: list[FilterHint] = []  # Evidence: prompt phrase → filters chosen
+    excluded_genres: list[str] = []  # Available genres the model left out on purpose
     reasoning: str = ""
 
 
@@ -773,6 +1260,10 @@ class ResultListItem(BaseModel):
     art_rating_key: str | None = None
     subtitle: str | None = None
     created_at: str
+    playlist_id: str | None = None  # Plex playlist this row was saved as
+    playlist_title: str | None = None
+    playlist_owner: str | None = None
+    playlist_url: str | None = None
 
 
 class ResultListResponse(BaseModel):
@@ -794,6 +1285,10 @@ class ResultDetail(BaseModel):
     art_rating_key: str | None = None
     subtitle: str | None = None
     created_at: str
+    playlist_id: str | None = None
+    playlist_title: str | None = None
+    playlist_owner: str | None = None
+    playlist_url: str | None = None
     snapshot: dict
 
 
@@ -861,3 +1356,149 @@ class SetupCompleteResponse(BaseModel):
     """Response from marking setup as complete."""
 
     success: bool
+
+
+# =============================================================================
+# Spotify Playlist Import Models
+# =============================================================================
+
+
+class SpotifyMatchedTrack(BaseModel):
+    """One library track that answered a Spotify playlist row."""
+
+    rating_key: str
+    title: str
+    artist: str
+    album: str
+    duration_ms: int = 0
+    position: int = 0  # 1-based slot of the Spotify row it came from
+    match_kind: str = "exact"  # exact song key | version (album-free) | album (artist-free) | search (live Plex)
+
+
+class SpotifyMissingSong(BaseModel):
+    """One Spotify playlist row the library had no answer for.
+
+    Also the shape stored in the cache's ``missing_songs`` table, which is the
+    wish list: everything an import could not play stays there so the songs
+    can be gotten later.
+    """
+
+    position: int = 0  # 1-based slot within its Spotify playlist
+    title: str = ""
+    album: str = ""
+    artist: str = ""
+    duration_ms: int = 0
+    spotify_track_id: str = ""
+    spotify_url: str = ""
+    playlist_ref: str = ""  # The playlist import that missed this song
+    playlist_name: str = ""  # Its display name, for reading the wish list
+    recorded_at: str = ""  # When it was written ("" until persisted)
+
+
+class SpotifyImportPreviewRequest(BaseModel):
+    """Ask what a Spotify playlist would match, without writing anything."""
+
+    playlist_ref: str  # open.spotify.com URL, spotify:playlist:<id>, or a bare id
+
+    @field_validator("playlist_ref")
+    @classmethod
+    def validate_playlist_ref(cls, v: str) -> str:
+        ref = (v or "").strip()
+        if not ref:
+            raise ValueError("playlist_ref must name the Spotify playlist (URL or id)")
+        return ref
+
+
+class SpotifyImportPreviewResponse(BaseModel):
+    """What a Spotify playlist matched against the library; nothing written."""
+
+    playlist_name: str = ""
+    playlist_owner: str = ""  # The Spotify playlist's owner, when it names one
+    spotify_playlist_url: str = ""  # Canonical open.spotify.com URL
+    source: str = ""  # "api" (fresh fetch) or "dump" (local parquet snapshot)
+    total_tracks: int = 0  # Spotify rows read (episodes and bare locals dropped)
+    matched: list[SpotifyMatchedTrack] = []
+    missing: list[SpotifyMissingSong] = []
+    warnings: list[str] = []
+
+
+class SpotifyImportRequest(BaseModel):
+    """Import a Spotify playlist as a Plex playlist; missing songs are recorded."""
+
+    playlist_ref: str  # open.spotify.com URL, spotify:playlist:<id>, or a bare id
+    name: str = ""  # Plex playlist name (default: the Spotify playlist's name)
+    description: str = ""
+    user: str = OWNER_USER_KEY  # Owner of the playlist written to Plex
+    copy_to: list[str] = []  # Additional users to receive their own copy
+
+    @field_validator("playlist_ref")
+    @classmethod
+    def validate_playlist_ref(cls, v: str) -> str:
+        ref = (v or "").strip()
+        if not ref:
+            raise ValueError("playlist_ref must name the Spotify playlist (URL or id)")
+        return ref
+
+    @field_validator("user")
+    @classmethod
+    def normalize_user(cls, v: str) -> str:
+        return (v or "").strip() or OWNER_USER_KEY
+
+    @field_validator("copy_to")
+    @classmethod
+    def validate_copy_to(cls, v: list[str]) -> list[str]:
+        return _validate_user_keys(v)
+
+    @field_validator("description")
+    @classmethod
+    def truncate_description(cls, v: str) -> str:
+        return _truncate_description(v)
+
+    @model_validator(mode="after")
+    def drop_redundant_owner_copy(self) -> "SpotifyImportRequest":
+        # Same rule as SavePlaylistRequest: the owning account gets the primary
+        # playlist, so a copy aimed at the same Plex key would write a second
+        # identical playlist.
+        self.copy_to = [key for key in self.copy_to if key != self.user]
+        return self
+
+
+class SpotifyImportResponse(BaseModel):
+    """An imported Spotify playlist as written to Plex, plus its wish list."""
+
+    success: bool
+    error: str | None = None
+    playlist_name: str = ""
+    playlist_owner: str = ""  # The Spotify playlist's owner, when it names one
+    spotify_playlist_url: str = ""  # Canonical open.spotify.com URL
+    source: str = ""  # "api" or "dump"
+    total_tracks: int = 0
+    matched: list[SpotifyMatchedTrack] = []
+    missing: list[SpotifyMissingSong] = []
+    matched_count: int = 0
+    missing_count: int = 0
+    missing_recorded: int = 0  # Wish-list rows written to the cache DB for this playlist
+    result_id: str | None = None  # History row saved for this import
+    playlist_id: str | None = None  # Plex playlist created
+    playlist_url: str | None = None  # Plex web URL for it
+    tracks_added: int | None = None
+    tracks_skipped: int | None = None
+    owner: str | None = None  # Display name of the Plex account that owns it
+    copies: list[PlexPlaylistCopy] = []
+    warnings: list[str] = []
+
+
+class SpotifyMissingSummary(BaseModel):
+    """One imported playlist and how many of its songs the library lacks."""
+
+    playlist_ref: str = ""
+    playlist_name: str = ""
+    count: int = 0
+
+
+class SpotifyMissingListResponse(BaseModel):
+    """The stored wish list: songs imported playlists asked for but lacked."""
+
+    missing: list[SpotifyMissingSong] = []
+    playlists: list[SpotifyMissingSummary] = []
+    total: int = 0

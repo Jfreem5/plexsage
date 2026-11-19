@@ -50,6 +50,7 @@ htmlcov/
 .specify/
 specs/
 initial-spec.md
+AGENTS.md
 CLAUDE.md
 CODE_REVIEW.md
 docs/plans/
@@ -86,6 +87,17 @@ logs/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+
+# Optional external datasources are machine state as well: a user's third-party
+# parquet/CSV/JSONL dump under data/ must never be committed.
+data/external/
+data/*.parquet
+data/*.parquet.*
+data/*.jsonl
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
 
 # Temporary files
 tmp/

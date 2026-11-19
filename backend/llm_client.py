@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import anthropic
+
 from google import genai
 from google.genai import types as genai_types
 import httpx
@@ -49,6 +50,10 @@ TOKENS_PER_TRACK = 40
 
 # Tokens per album for recommendation flow (artist, album, year, genres)
 TOKENS_PER_ALBUM = 25
+
+# Output budget sent to OpenAI-compatible endpoints. Reasoning models spend part of it
+# on hidden thinking, so a small value truncates the answer (finish_reason "length").
+MAX_OUTPUT_TOKENS = 8192
 
 
 @dataclass
@@ -104,9 +109,17 @@ class LLMClient:
         self._client: Any = None
 
         if config.provider == "anthropic":
-            self._client = anthropic.Anthropic(api_key=config.api_key)
+            self._client = anthropic.Anthropic(
+                api_key=config.api_key,
+                timeout=config.request_timeout,
+                max_retries=config.max_retries,
+            )
         elif config.provider == "openai":
-            self._client = openai.OpenAI(api_key=config.api_key)
+            self._client = openai.OpenAI(
+                api_key=config.api_key,
+                timeout=config.request_timeout,
+                max_retries=config.max_retries,
+            )
         elif config.provider == "gemini":
             self._client = genai.Client(api_key=config.api_key)
         elif config.provider == "custom":
@@ -114,6 +127,8 @@ class LLMClient:
             self._client = openai.OpenAI(
                 api_key=config.api_key or "not-needed",  # Use configured key or placeholder
                 base_url=config.custom_url,
+                timeout=config.request_timeout,
+                max_retries=config.max_retries,
             )
         # Note: Ollama uses httpx directly, no persistent client needed
 
@@ -124,7 +139,7 @@ class LLMClient:
         logger.info("Calling Anthropic API with %d char prompt", len(prompt))
         response = self._client.messages.create(
             model=model,
-            max_tokens=8192,
+            max_tokens=MAX_OUTPUT_TOKENS,
             system=system,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -145,7 +160,7 @@ class LLMClient:
         logger.info("Calling OpenAI-compatible API with %d char prompt", len(prompt))
         response = self._client.chat.completions.create(
             model=model,
-            max_tokens=8192,
+            max_tokens=MAX_OUTPUT_TOKENS,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
@@ -153,7 +168,21 @@ class LLMClient:
         )
         logger.debug("OpenAI-compatible response received")
 
-        content = response.choices[0].message.content
+        choice = response.choices[0]
+        message = choice.message
+        # mlx_lm and other reasoning-only templates put the answer under "reasoning"
+        # (or send nothing at all) while the output budget is still spent thinking,
+        # so content is None rather than "". Fall back to an empty string.
+        content = message.content or ""
+        if not content and getattr(choice, "finish_reason", None) == "length":
+            logger.warning(
+                "Response truncated at max_tokens=%d with no visible content: the model "
+                "spent the whole budget on hidden reasoning. Ask the endpoint for its "
+                "reasoning toggle (e.g. mlx_lm: --chat-template-args "
+                "'{\"enable_thinking\":false}').",
+                MAX_OUTPUT_TOKENS,
+            )
+
         # Use getattr for safe token access (custom providers may omit usage)
         input_tokens = getattr(response.usage, "prompt_tokens", 0) if response.usage else 0
         output_tokens = getattr(response.usage, "completion_tokens", 0) if response.usage else 0
@@ -226,7 +255,7 @@ class LLMClient:
         raise RuntimeError(f"Gemini API failed after {max_retries} attempts: {last_error}")
 
     def _complete_ollama(
-        self, prompt: str, system: str, model: str, timeout: float = 600.0
+        self, prompt: str, system: str, model: str, timeout: float | None = None
     ) -> LLMResponse:
         """Make a completion request to Ollama.
 
@@ -234,13 +263,16 @@ class LLMClient:
             prompt: User prompt
             system: System prompt
             model: Model name (e.g., "llama3:8b")
-            timeout: Request timeout in seconds (default 10 minutes for slow hardware)
+            timeout: Request timeout in seconds (defaults to config.request_timeout;
+                     local hardware can be slow)
 
         Returns:
             LLMResponse with content and token counts
         """
         logger.info("Calling Ollama API with %d char prompt", len(prompt))
         ollama_url = self.config.ollama_url.rstrip("/")
+        if timeout is None:
+            timeout = self.config.request_timeout
 
         with httpx.Client(timeout=timeout) as client:
             response = client.post(
@@ -399,13 +431,17 @@ class LLMClient:
         Raises:
             ValueError: If JSON cannot be parsed
         """
-        content = response.content.strip()
+        content = (response.content or "").strip()
 
         # Check for empty response first
         if not content:
             raise ValueError(
-                "LLM returned an empty response. This may happen if the context "
-                "window is too small. Try reducing 'Max Tracks to AI' in filters."
+                "LLM returned an empty response. With a reasoning model this usually "
+                "means the whole max_tokens budget went to hidden thinking and no answer "
+                "was produced (finish_reason 'length'); disable thinking at the endpoint "
+                "(mlx_lm: --chat-template-args '{\"enable_thinking\":false}'). Otherwise "
+                "the context window may be too small - try reducing 'Max Tracks to AI' in "
+                "filters."
             )
 
         # Try to extract JSON from markdown code blocks

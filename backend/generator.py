@@ -17,6 +17,7 @@ from backend.prompt_classifier import (
     is_genre_keyword,
 )
 from backend import library_cache
+from backend import agent_reasoning
 
 logger = logging.getLogger(__name__)
 
@@ -40,17 +41,58 @@ MIN_TRACKS_PER_PICK = 6    # Scale the floor with the requested playlist size
 _SPECIFICITY_EXPLICIT_GENRE = 0.6  # One or two explicit genre filters
 _SPECIFICITY_BROAD_GENRE = 0.4     # Many explicit genre filters (broader)
 _SPECIFICITY_DECADE = 0.2          # An explicit decade filter
+_SPECIFICITY_ARTIST = 0.3          # Naming performers narrows the library hard
+_SPECIFICITY_EXCLUSION = 0.2       # Ruling a genre/artist/decade out narrows it too
+_SPECIFICITY_WINDOW = 0.2          # A duration, year or play-count window
+_SPECIFICITY_FLAG = 0.1            # A yes/no narrowing request (unheard, no compilations)
 
 
 def _prompt_specificity(
     prompt: str | None,
     genres: list[str] | None = None,
     decades: list[str] | None = None,
+    artists: list[str] | None = None,
+    exclude_genres: list[str] | None = None,
+    min_duration_ms: int = 0,
+    max_duration_ms: int = 0,
+    min_rating: int = 0,
+    exclude_artists: list[str] | None = None,
+    exclude_decades: list[str] | None = None,
+    min_year: int = 0,
+    max_year: int = 0,
+    min_plays: int = 0,
+    max_plays: int = 0,
+    unheard_only: bool = False,
+    exclude_compilations: bool = False,
 ) -> float:
     """Score how *specific* a request is, from 0.0 (vague) to 1.0 (narrow).
 
-    Concrete genre/decade cues raise the score; a mood/activity prompt with no
-    genre cue stays low so the LLM gets a wider pool of options.
+    Concrete genre/decade cues raise the score; so do named artists, genre/artist/
+    decade exclusions, a duration/year/play-count window, a rating floor and the
+    yes-no narrowing requests (unheard-only, drop compilations), since all of
+    those pre-narrow the pool the LLM has to choose from. A mood/activity prompt
+    with no such cue stays low so the LLM gets a wider pool of options.
+
+    The year and play-count windows share the duration window's band: they trim
+    the candidate pool just as hard. A yes/no flag scores lower because it only
+    removes one class of rows (never-played tracks, or the Various-Artists ones).
+
+    Args:
+        prompt: Natural-language request (``None`` for the seed-track flow).
+        genres: Explicitly selected genre filters.
+        decades: Explicitly selected decade filters.
+        artists: Explicitly selected artist filters.
+        exclude_genres / exclude_artists / exclude_decades: Names the request
+            rules out.
+        min_duration_ms / max_duration_ms: Track-length window in force.
+        min_rating: User-rating floor in force (0 = none).
+        min_year / max_year: Release-year window in force (0 = unbounded).
+        min_plays / max_plays: Plex play-count window in force (0 = unbounded).
+        unheard_only: Only never-played tracks.
+        exclude_compilations: Various-Artists compilations dropped.
+
+    Returns:
+        Specificity score, capped at 1.0.
     """
     specificity = 0.0
 
@@ -78,6 +120,24 @@ def _prompt_specificity(
     if decades:
         specificity += _SPECIFICITY_DECADE
 
+    if artists:
+        specificity += _SPECIFICITY_ARTIST
+    if exclude_genres or exclude_artists or exclude_decades:
+        specificity += _SPECIFICITY_EXCLUSION
+    if (
+        min_duration_ms
+        or max_duration_ms
+        or min_rating
+        or min_year
+        or max_year
+        or min_plays
+        or max_plays
+        or unheard_only
+    ):
+        specificity += _SPECIFICITY_WINDOW
+    if exclude_compilations:
+        specificity += _SPECIFICITY_FLAG
+
     return min(1.0, specificity)
 
 
@@ -88,6 +148,19 @@ def compute_track_budget(
     pool_size: int | None = None,
     genres: list[str] | None = None,
     decades: list[str] | None = None,
+    artists: list[str] | None = None,
+    exclude_genres: list[str] | None = None,
+    min_duration_ms: int = 0,
+    max_duration_ms: int = 0,
+    min_rating: int = 0,
+    exclude_artists: list[str] | None = None,
+    exclude_decades: list[str] | None = None,
+    min_year: int = 0,
+    max_year: int = 0,
+    min_plays: int = 0,
+    max_plays: int = 0,
+    unheard_only: bool = False,
+    exclude_compilations: bool = False,
 ) -> int:
     """Return how many candidate tracks to send to the LLM for this request.
 
@@ -104,6 +177,15 @@ def compute_track_budget(
         pool_size: Size of the candidate pool, if known.
         genres: Explicitly selected genre filters.
         decades: Explicitly selected decade filters.
+        artists: Explicitly selected artist filters.
+        exclude_genres / exclude_artists / exclude_decades: Filters that drop
+            named genres, artists and decades.
+        min_duration_ms / max_duration_ms: Track-length window in force.
+        min_rating: User-rating floor in force (0 = none).
+        min_year / max_year: Release-year window in force (0 = unbounded).
+        min_plays / max_plays: Plex play-count window in force (0 = unbounded).
+        unheard_only: Only never-played tracks.
+        exclude_compilations: Various-Artists compilations dropped.
 
     Returns:
         Number of tracks to keep after pre-ranking (0 only if the pool is empty).
@@ -118,7 +200,24 @@ def compute_track_budget(
     if ceiling <= floor:
         return max(0, ceiling)
 
-    specificity = _prompt_specificity(prompt, genres, decades)
+    specificity = _prompt_specificity(
+        prompt,
+        genres,
+        decades,
+        artists,
+        exclude_genres,
+        min_duration_ms,
+        max_duration_ms,
+        min_rating,
+        exclude_artists,
+        exclude_decades,
+        min_year,
+        max_year,
+        min_plays,
+        max_plays,
+        unheard_only,
+        exclude_compilations,
+    )
     budget = ceiling - (ceiling - floor) * specificity
     return max(floor, min(ceiling, round(budget)))
 
@@ -168,14 +267,40 @@ def pre_rank_tracks(
     genres: list[str] | None = None,
     decades: list[str] | None = None,
     max_tracks: int = PRE_RANK_LIMIT,
+    artists: list[str] | None = None,
+    exclude_genres: list[str] | None = None,
+    min_duration_ms: int = 0,
+    max_duration_ms: int = 0,
+    exclude_artists: list[str] | None = None,
+    exclude_decades: list[str] | None = None,
+    min_year: int = 0,
+    max_year: int = 0,
+    min_plays: int = 0,
+    max_plays: int = 0,
+    unheard_only: bool = False,
 ) -> list[Track]:
     """Score and rank tracks using rule-based heuristics, returning the top N.
 
-    Scoring components (total max = 100):
+    Scoring components (total max = 100, plus bonuses and penalties):
         1. Genre match   (0-40)  -- how well the track's genres match prompt hints
         2. Decade match  (0-20)  -- whether the track's year falls in hinted decades
         3. User rating   (0-25)  -- from the local library cache (0-10 scale)
         4. Recency       (0-15)  -- exponential decay on last played (72h half-life)
+        5. Artist match  (0-30)  -- the track is one of the named performers
+        6. Length window (+-10)  -- inside vs. outside the requested duration window
+        7. Excluded genre (-40)  -- the track carries a genre the request ruled out
+        8. Year window   (+-10)  -- inside vs. outside the requested release years
+        9. Banned artist (-30)   -- the track is one of the excluded performers
+        10. Banned decade (-20)  -- the track's year falls in an excluded decade
+        11. Play window  (+-10)  -- inside vs. outside the familiarity request
+        12. Curation affinity (0-15) -- how much the agent's own stored
+            selection reasons for the track (mined tags, see
+            :mod:`backend.agent_reasoning`) overlap the request's hints
+
+    Components 5-11 mostly matter on the live-Plex path, where those filters can
+    only be applied partially; on the cache path the pool is already narrowed.
+    The play-count component needs the local cache's ``view_count``, so a track
+    the cache has no row for simply does not move on that axis.
 
     If no prompt hints are found, the function falls back to rating + recency
     only, so the LLM still gets a sensible ordering.
@@ -186,6 +311,17 @@ def pre_rank_tracks(
         genres: Optional explicit genre filters -- additional hard hints.
         decades: Optional explicit decade filters -- additional hard hints.
         max_tracks: Maximum number of tracks to return (0 = no limit).
+        artists: Optional explicit artist filters -- strong preference bonus.
+        exclude_genres: Genres the request rules out -- applied as a penalty so a
+                        stray match cannot displace a clean candidate.
+        min_duration_ms / max_duration_ms: Requested track-length window.
+        exclude_artists: Performers the request rules out -- same penalty shape
+                         as the artist-match bonus.
+        exclude_decades: Decades the request rules out -- same penalty shape as
+                         the decade-match bonus.
+        min_year / max_year: Requested release-year window (0 = unbounded).
+        min_plays / max_plays: Requested Plex play-count window (0 = unbounded).
+        unheard_only: Prefer tracks with a zero play count.
 
     Returns:
         A new list of up to *max_tracks* tracks, sorted by score descending.
@@ -207,12 +343,27 @@ def pre_rank_tracks(
     for d in decades or []:
         hinted_decades.add(d)
 
+    excluded_lower = [g.lower() for g in exclude_genres or []]
+    window_open = min_duration_ms > 0 or max_duration_ms > 0
+    year_open = min_year > 0 or max_year > 0
+    play_open = min_plays > 0 or max_plays > 0 or unheard_only
+
     # --- Fetch cache metadata in one batch ---
     metadata: dict[str, dict] = {}
     try:
         metadata = library_cache.get_metadata_batch([t.rating_key for t in tracks])
     except Exception:
         logger.warning("Pre-rank metadata unavailable; ranking without ratings", exc_info=True)
+
+    # --- Fetch the agent's mined selection-reason tags in one batch -------
+    # Past curation is a filter signal: a track whose own stored reasons speak
+    # the current request's language has already survived this bar once.
+    past_tags: dict[str, set[str]] = {}
+    try:
+        past_tags = agent_reasoning.get_reason_tags([t.rating_key for t in tracks])
+    except Exception:
+        logger.warning("Pre-rank curation tags unavailable; ranking without affinity", exc_info=True)
+    hinted_tags: set[str] = hinted_genres | hinted_decades
 
     now = time.time()
     scored: list[tuple[float, Track]] = []
@@ -245,7 +396,49 @@ def pre_rank_tracks(
             if track_decade in hinted_decades:
                 score += 20
 
-        # 3. User rating (0-25)  +  4. Recency (0-15)
+        # 12. Curation affinity (0-15)
+        if past_tags and hinted_tags:
+            mine = past_tags.get(track.rating_key)
+            if mine:
+                overlap = mine & hinted_tags
+                if overlap:
+                    # Proportional like the genre match: reasons that speak
+                    # more of the request's vocabulary move the track further
+                    # into the AI pool.
+                    score += min(len(overlap) / len(hinted_tags), 1.0) * 15
+
+        # 5. Artist match (0-30)
+        if artists and library_cache._matches_artist(track.artist, artists):
+            score += 30
+
+        # 6. Length window (+-10)
+        if window_open:
+            length = track.duration_ms or 0
+            inside = (min_duration_ms <= 0 or length >= min_duration_ms) and (
+                max_duration_ms <= 0 or (length > 0 and length <= max_duration_ms)
+            )
+            score += 10 if inside else -10
+
+        # 8. Recording-year window (+-10)
+        if year_open and track.year:
+            inside = (min_year <= 0 or track.year >= min_year) and (
+                max_year <= 0 or track.year <= max_year
+            )
+            score += 10 if inside else -10
+
+        # 10. Banned decade (-20)
+        if exclude_decades and track.year and _year_to_decade(track.year) in set(exclude_decades):
+            score -= 20
+
+        # 9. Banned artist (-30)
+        if exclude_artists and library_cache._matches_artist(track.artist, exclude_artists):
+            score -= 30
+
+        # 7. Excluded genre (-40)
+        if excluded_lower and any(g in {t.lower() for t in track.genres} for g in excluded_lower):
+            score -= 40
+
+        # 3. User rating (0-25)  +  4. Recency (0-15)  +  11. Familiarity window (+-10)
         meta = metadata.get(track.rating_key)
         if meta:
             rating = meta.get("user_rating", 0) or 0
@@ -254,6 +447,18 @@ def pre_rank_tracks(
             last_played_ts = _parse_timestamp(meta.get("last_viewed_at"))
             recency = _recency_score(last_played_ts, now)
             score += recency * 15
+
+            if play_open:
+                # Plex's play counter lives in the cache; a track with no row
+                # there has no opinion to give, so it stays where it ranked.
+                plays = meta.get("view_count") or 0
+                if unheard_only:
+                    score += 10 if plays == 0 else -10
+                else:
+                    inside = (min_plays <= 0 or plays >= min_plays) and (
+                        max_plays <= 0 or plays <= max_plays
+                    )
+                    score += 10 if inside else -10
 
         scored.append((score, track))
 
@@ -350,6 +555,135 @@ def _cached_track_to_model(cached: dict) -> Track:
     )
 
 
+def _past_reasons_for(tracks: list[Track]) -> dict[str, str]:
+    """Stored curation reasons replayed for *tracks* ({} when the memory is empty).
+
+    The agent's own earlier argument for a track, not a third-party fact, so the
+    candidate legend words it as the agent's own judgement. Budgeted per
+    line and per candidate set by :mod:`backend.agent_reasoning`.
+    """
+    if not tracks or not agent_reasoning.has_reasoning_data():
+        return {}
+    reasons = agent_reasoning.get_previous_reasons(
+        [t.rating_key for t in tracks][: agent_reasoning.MAX_TRACKS_WITH_PAST_REASON]
+    )
+    return {key: reason[: agent_reasoning.MAX_PAST_REASON_CHARS] for key, reason in reasons.items()}
+
+
+# =============================================================================
+# Candidate Pool Relaxation
+# =============================================================================
+
+# The facet names :func:`compute_track_budget` reads. ``exclude_live`` says which
+# tracks qualify but says nothing about how specific the request is, so it stays
+# out of the budget's kwargs.
+BUDGET_FACETS = (
+    "genres",
+    "decades",
+    "artists",
+    "exclude_genres",
+    "exclude_artists",
+    "exclude_decades",
+    "min_year",
+    "max_year",
+    "min_plays",
+    "max_plays",
+    "unheard_only",
+    "exclude_compilations",
+    "min_duration_ms",
+    "max_duration_ms",
+    "min_rating",
+)
+
+
+def candidate_facets(
+    genres: list[str] | None = None,
+    decades: list[str] | None = None,
+    artists: list[str] | None = None,
+    exclude_genres: list[str] | None = None,
+    exclude_artists: list[str] | None = None,
+    exclude_decades: list[str] | None = None,
+    min_year: int = 0,
+    max_year: int = 0,
+    min_plays: int = 0,
+    max_plays: int = 0,
+    unheard_only: bool = False,
+    exclude_compilations: bool = False,
+    min_rating: int = 0,
+    min_duration_ms: int = 0,
+    max_duration_ms: int = 0,
+    exclude_live: bool = True,
+    rating_user: str = "",
+) -> dict:
+    """Spell the cache-branch filters once, as one splittable dict.
+
+    Counting and fetching must agree on the facet names and on the neutral value
+    for "off", so both read this dict instead of repeating the argument list; the
+    relaxation ladder in turn refuses any key :data:`library_cache.FILTER_NEUTRALS`
+    does not know how to clear.
+
+    ``rating_user`` is spelled here too, but it is never in a relaxation tier:
+    switching whose ratings are read re-reads the same rows, so it cannot widen a
+    pool, and dropping it would answer a member's rating floor with the admin's
+    column while still claiming the filters were honoured.
+
+    Returns:
+        The filter kwargs :func:`_get_tracks_from_cache_or_plex` takes, with empty
+        lists spelled ``None`` as the cache functions treat them.
+    """
+    return {
+        "genres": genres or None,
+        "decades": decades or None,
+        "artists": artists or None,
+        "exclude_genres": exclude_genres or None,
+        "exclude_artists": exclude_artists or None,
+        "exclude_decades": exclude_decades or None,
+        "min_year": min_year,
+        "max_year": max_year,
+        "min_plays": min_plays,
+        "max_plays": max_plays,
+        "unheard_only": unheard_only,
+        "exclude_compilations": exclude_compilations,
+        "min_rating": min_rating,
+        "min_duration_ms": min_duration_ms,
+        "max_duration_ms": max_duration_ms,
+        "exclude_live": exclude_live,
+        "rating_user": rating_user or "",
+    }
+
+
+def relax_candidate_pool(
+    facets: dict,
+    prompt: str | None = None,
+    track_count: int = 25,
+    requested_max: int = 0,
+    count: int | None = None,
+) -> dict:
+    """Widen the cache filters until the AI step's candidate budget is reachable.
+
+    The target is the budget measured against an unbounded pool: the pool itself is
+    what is being looked for, so feeding its own size back in would stop the ladder
+    before it started. The ladder gives up the library's bans, then its rating and
+    play floors, then year and duration windows, then compilations and live rows,
+    and only at the end the genre/decade/artist whitelist - and that last
+    one only when the pool cannot even fill the requested playlist, so a narrow
+    request that is already answered stays narrow.
+
+    Returns:
+        :func:`library_cache.relax_filters_for_target`'s dict (``filters``,
+        ``matching``, ``asked``, ``target``, ``tier``, ``relaxed``, ``short_by``).
+    """
+    want = compute_track_budget(
+        prompt=prompt,
+        requested_max=requested_max,
+        track_count=track_count,
+        **{name: facets[name] for name in BUDGET_FACETS if name in facets},
+    )
+    return library_cache.relax_filters_for_target(
+        facets, want, count=count, identity_floor=track_count
+    )
+
+
 def _get_tracks_from_cache_or_plex(
     plex_client,
     genres: list[str] | None,
@@ -357,42 +691,134 @@ def _get_tracks_from_cache_or_plex(
     exclude_live: bool,
     min_rating: int,
     max_tracks_to_ai: int,
+    artists: list[str] | None = None,
+    exclude_genres: list[str] | None = None,
+    min_duration_ms: int = 0,
+    max_duration_ms: int = 0,
+    exclude_artists: list[str] | None = None,
+    exclude_decades: list[str] | None = None,
+    min_year: int = 0,
+    max_year: int = 0,
+    min_plays: int = 0,
+    max_plays: int = 0,
+    unheard_only: bool = False,
+    exclude_compilations: bool = False,
+    rating_user: str = "",
 ) -> list[Track]:
     """Get tracks from cache if available, otherwise from Plex.
+
+    Args:
+        plex_client: Connected Plex client, used when the cache is empty.
+        genres: Genre filter (OR matching).
+        decades: Decade filter (OR matching).
+        exclude_live: Drop live recordings.
+        min_rating: User-rating floor (0 = none).
+        max_tracks_to_ai: Candidate cap (0 = library default).
+        artists: Artist filter (OR matching).
+        exclude_genres: Genres to drop.
+        min_duration_ms / max_duration_ms: Track-length window (0 = unbounded).
+        exclude_artists: Artist names to drop.
+        exclude_decades: Decades to drop (undated tracks survive).
+        min_year / max_year: Release-year window (0 = unbounded).
+        min_plays / max_plays: Plex play-count window (0 = unbounded).
+        unheard_only: Require a zero play count.
+        exclude_compilations: Drop the Various-Artists rows.
+        rating_user: Plex account whose stars the rating facets read — "" or
+            ``__owner__`` means the connecting admin's ``user_rating`` column, a
+            household member's exact title or a shared friend's username reads the
+            cache's ``user_ratings`` rows instead. Cache branch only: a live Plex
+            walk sees one account's stars and cannot name another's.
 
     Returns:
         List of Track objects
     """
-    has_filters = genres or decades or min_rating > 0
+    has_filters = bool(
+        genres
+        or decades
+        or artists
+        or exclude_genres
+        or exclude_artists
+        or exclude_decades
+        or min_rating > 0
+        or min_duration_ms > 0
+        or max_duration_ms > 0
+        or min_year > 0
+        or max_year > 0
+        or min_plays > 0
+        or max_plays > 0
+        or unheard_only
+        or exclude_compilations
+    )
     effective_limit = max_tracks_to_ai if max_tracks_to_ai > 0 else 2000
 
     # Try cache first
     if library_cache.has_cached_tracks():
         logger.info("Using cached tracks for generation")
+        wanted_ratings = rating_user or ""
+        if wanted_ratings:
+            # A member's stars are not on the admin's walk, so their rows are loaded
+            # here once and every later request pays nothing. A failed scan may not
+            # read as "this member rated nothing": the effective rating is
+            # COALESCE(user_ratings, tracks.user_rating), so missing rows would answer
+            # every track with the admin's column and a rating floor would then drop
+            # exactly the tracks the member had rated.
+            try:
+                library_cache.ensure_user_ratings(wanted_ratings, plex_client)
+            except PlexQueryError as exc:
+                logger.warning(
+                    "Rating facets fall back to the admin's stars: %s", exc
+                )
+                wanted_ratings = ""
         cached_tracks = library_cache.get_tracks_by_filters(
             genres=genres,
             decades=decades,
+            artists=artists,
+            exclude_genres=exclude_genres,
             min_rating=min_rating,
+            min_duration_ms=min_duration_ms,
+            max_duration_ms=max_duration_ms,
             exclude_live=exclude_live,
             limit=effective_limit,
+            exclude_artists=exclude_artists,
+            exclude_decades=exclude_decades,
+            min_year=min_year,
+            max_year=max_year,
+            min_plays=min_plays,
+            max_plays=max_plays,
+            unheard_only=unheard_only,
+            exclude_compilations=exclude_compilations,
+            rating_user=wanted_ratings,
         )
         return [_cached_track_to_model(t) for t in cached_tracks]
 
-    # Fall back to Plex
+    # Fall back to Plex. rating_user cannot be honoured here: another account's
+    # stars exist only in the cache's user_ratings table, and a live Plex walk sees
+    # the connecting admin's column, so the facets stay as asked against that one.
     logger.info("Cache empty, fetching from Plex")
     if not has_filters:
         return plex_client.get_random_tracks(
             count=effective_limit,
             exclude_live=exclude_live,
         )
-    else:
-        return plex_client.get_tracks_by_filters(
-            genres=genres,
-            decades=decades,
-            exclude_live=exclude_live,
-            min_rating=min_rating,
-            limit=effective_limit,
-        )
+    return plex_client.get_tracks_by_filters(
+        genres=genres,
+        decades=decades,
+        exclude_live=exclude_live,
+        min_rating=min_rating,
+        limit=effective_limit,
+        artists=artists,
+        exclude_genres=exclude_genres,
+        min_duration_ms=min_duration_ms,
+        max_duration_ms=max_duration_ms,
+        exclude_artists=exclude_artists,
+        exclude_decades=exclude_decades,
+        min_year=min_year,
+        max_year=max_year,
+        min_plays=min_plays,
+        max_plays=max_plays,
+        unheard_only=unheard_only,
+        exclude_compilations=exclude_compilations,
+    )
 
 
 def generate_playlist_stream(
@@ -407,8 +833,33 @@ def generate_playlist_stream(
     exclude_live: bool = True,
     min_rating: int = 0,
     max_tracks_to_ai: int = 500,
+    artists: list[str] | None = None,
+    exclude_genres: list[str] | None = None,
+    min_duration_ms: int = 0,
+    max_duration_ms: int = 0,
+    exclude_artists: list[str] | None = None,
+    exclude_decades: list[str] | None = None,
+    min_year: int = 0,
+    max_year: int = 0,
+    min_plays: int = 0,
+    max_plays: int = 0,
+    unheard_only: bool = False,
+    exclude_compilations: bool = False,
+    style_cues: list[str] | None = None,
+    rating_user: str = "",
 ) -> Generator[str, None, None]:
     """Generate a playlist with streaming progress updates.
+
+    The hard filters (genres, decades, artists, genre/artist/decade exclusions,
+    a release-year window, a play-count window, an unheard-only flag, a
+    compilation drop, a rating floor and a duration window) narrow which tracks
+    are candidates; ``style_cues`` are the soft half of an analysis — mood,
+    tempo and texture phrases the library has no column for — so they are
+    written into the curator prompt instead of enforced against metadata. ``rating_user``
+    names whose stars a rating floor reads: "" is the connecting admin's ``user_rating``
+    column, any other Plex key reads that account's ``user_ratings`` rows (scanned into the
+    cache on the first ask) and is honoured on the cache branch only — a live Plex walk sees
+    one account's stars and cannot name another's.
 
     Yields SSE-formatted events with progress updates and final result.
     """
@@ -427,27 +878,119 @@ def generate_playlist_stream(
             yield emit("error", {"message": "Plex client not initialized"})
             return
 
-        has_filters = genres or decades or min_rating > 0
+        has_filters = bool(
+            genres
+            or decades
+            or artists
+            or exclude_genres
+            or exclude_artists
+            or exclude_decades
+            or min_rating > 0
+            or min_duration_ms > 0
+            or max_duration_ms > 0
+            or min_year > 0
+            or max_year > 0
+            or min_plays > 0
+            or max_plays > 0
+            or unheard_only
+            or exclude_compilations
+        )
 
-        # Step 1: Fetch tracks from cache or Plex
+        # Step 1: Size the pool, then fetch it. The strictest reading of a request
+        # is not always what the cache can honour: one rating floor the analyzer
+        # invented ("best of all time" became min_rating >= 8) once cut 337 Holiday
+        # tracks to 5, which reads back as a thin playlist rather than a broken one.
+        # On the cache branch only, the ladder in
+        # :mod:`backend.library_cache` gives up the least specific constraint first
+        # until the candidate budget is reachable, and the tier names are reported
+        # so the playlist can say which filters it actually honoured. The live-Plex
+        # fallback keeps the filters exactly as asked: it has no counts to measure
+        # against.
         using_cache = library_cache.has_cached_tracks()
+        facets = candidate_facets(
+            genres=genres,
+            decades=decades,
+            artists=artists,
+            exclude_genres=exclude_genres,
+            exclude_artists=exclude_artists,
+            exclude_decades=exclude_decades,
+            min_year=min_year,
+            max_year=max_year,
+            min_plays=min_plays,
+            max_plays=max_plays,
+            unheard_only=unheard_only,
+            exclude_compilations=exclude_compilations,
+            min_rating=min_rating,
+            min_duration_ms=min_duration_ms,
+            max_duration_ms=max_duration_ms,
+            exclude_live=exclude_live,
+            rating_user=rating_user,
+        )
+        ladder = None
         if using_cache:
+            ladder = relax_candidate_pool(
+                facets,
+                prompt=prompt,
+                track_count=track_count,
+                requested_max=max_tracks_to_ai,
+            )
+            facets = ladder["filters"]
+            if ladder["tier"] != "as asked":
+                yield emit(
+                    "progress",
+                    {
+                        "step": "relaxing",
+                        "message": (
+                            f"Only {ladder['asked']:,} tracks matched as asked "
+                            f"(the AI step wants {ladder['target']:,}), so widening "
+                            f"the filters to {ladder['tier']} "
+                            f"[{ladder['matching']:,} tracks]"
+                        ),
+                    },
+                )
             yield emit("progress", {"step": "fetching", "message": "Loading tracks from cache..."})
         elif not has_filters:
             yield emit("progress", {"step": "fetching", "message": "Sampling random tracks from library..."})
         else:
             yield emit("progress", {"step": "fetching", "message": "Fetching tracks from library..."})
 
-        logger.info("Fetching tracks: genres=%s, decades=%s, min_rating=%s, using_cache=%s",
-                    genres, decades, min_rating, using_cache)
+        logger.info(
+            "Fetching tracks: genres=%s, decades=%s, artists=%s, exclude_genres=%s, "
+            "exclude_artists=%s, exclude_decades=%s, year=%s..%s, plays=%s..%s, "
+            "unheard_only=%s, exclude_compilations=%s, min_rating=%s, duration=%s..%s, "
+            "using_cache=%s",
+            genres,
+            decades,
+            artists,
+            exclude_genres,
+            exclude_artists,
+            exclude_decades,
+            min_year,
+            max_year,
+            min_plays,
+            max_plays,
+            unheard_only,
+            exclude_compilations,
+            min_rating,
+            min_duration_ms,
+            max_duration_ms,
+            using_cache,
+        )
+        if ladder:
+            logger.info(
+                "Filter relaxation: asked=%s, target=%s, tier=%s, relaxed=%s, pool=%s, short_by=%s",
+                ladder["asked"],
+                ladder["target"],
+                ladder["tier"],
+                ladder["relaxed"],
+                ladder["matching"],
+                ladder["short_by"],
+            )
         try:
             filtered_tracks = _get_tracks_from_cache_or_plex(
                 plex_client=plex_client,
-                genres=genres,
-                decades=decades,
-                exclude_live=exclude_live,
-                min_rating=min_rating,
                 max_tracks_to_ai=max_tracks_to_ai,
+                **facets,
             )
         except PlexQueryError as e:
             yield emit("error", {"message": f"Plex server error: {e}"})
@@ -460,7 +1003,7 @@ def generate_playlist_stream(
             return
 
         # Step 1b: Size the candidate set and pre-rank locally.
-        # A specific genre/decade request can pick from a smaller pool, while a
+        # A specific genre/decade/artist request can pick from a smaller pool, while a
         # vague mood prompt keeps a wider one. This trimming costs no tokens.
         budget = compute_track_budget(
             prompt=prompt,
@@ -469,6 +1012,19 @@ def generate_playlist_stream(
             pool_size=len(filtered_tracks),
             genres=genres,
             decades=decades,
+            artists=artists,
+            exclude_genres=exclude_genres,
+            min_duration_ms=min_duration_ms,
+            max_duration_ms=max_duration_ms,
+            min_rating=min_rating,
+            exclude_artists=exclude_artists,
+            exclude_decades=exclude_decades,
+            min_year=min_year,
+            max_year=max_year,
+            min_plays=min_plays,
+            max_plays=max_plays,
+            unheard_only=unheard_only,
+            exclude_compilations=exclude_compilations,
         )
         if budget > 0 and len(filtered_tracks) > budget:
             pool_size = len(filtered_tracks)
@@ -482,6 +1038,17 @@ def generate_playlist_stream(
                 genres=genres,
                 decades=decades,
                 max_tracks=budget,
+                artists=artists,
+                exclude_genres=exclude_genres,
+                min_duration_ms=min_duration_ms,
+                max_duration_ms=max_duration_ms,
+                exclude_artists=exclude_artists,
+                exclude_decades=exclude_decades,
+                min_year=min_year,
+                max_year=max_year,
+                min_plays=min_plays,
+                max_plays=max_plays,
+                unheard_only=unheard_only,
             )
             logger.info(
                 "Pre-ranked candidates from %d to %d (budget=%d)",
@@ -499,8 +1066,23 @@ def generate_playlist_stream(
         # Step 3: Build track list
         yield emit("progress", {"step": "preparing", "message": f"Preparing {len(filtered_tracks)} tracks for AI..."})
 
+        # A "Curated before:" tail is this agent's own earlier argument for a track
+        # (stored by record_run in the reasoning DB), reused so the model does not
+        # have to re-derive it. Without stored memory no tail is written.
+        past_reasons = _past_reasons_for(filtered_tracks)
+        if past_reasons:
+            legend = []
+            legend.append(
+                "Lines marked \"Curated before:\" carry the reason this library's curator "
+                "picked that track in an earlier playlist; it is the agent's own judgement, "
+                "honour it when the request fits and ignore it when the request asks for something else."
+            )
+            generation_parts_note = " ".join(legend)
+        else:
+            generation_parts_note = ""
         track_list = "\n".join(
             f"{i+1}. {t.artist} - {t.title} ({t.album}, {t.year or 'Unknown year'})"
+            + (f" | Curated before: {past_reasons[t.rating_key]}" if past_reasons.get(t.rating_key) else "")
             for i, t in enumerate(filtered_tracks)
         )
 
@@ -509,6 +1091,16 @@ def generate_playlist_stream(
 
         if prompt:
             generation_parts.append(f"User's request: {prompt}")
+
+        if style_cues:
+            # The library has no column for these, so they steer the picks rather
+            # than narrow the pool: the curator still chooses from the same list.
+            cues = [str(c).strip()[:120] for c in style_cues if str(c).strip()][:8]
+            if cues:
+                generation_parts.append(
+                    "Style cues from the request (prefer tracks that also satisfy these): "
+                    + "; ".join(cues)
+                )
 
         if seed_track:
             generation_parts.append(
@@ -526,7 +1118,17 @@ def generate_playlist_stream(
             if answered:
                 generation_parts.append(f"User preferences: {', '.join(answered)}")
 
-        generation_parts.append(f"\nSelect {track_count} tracks from this library:\n{track_list}")
+        if generation_parts_note:
+            generation_parts.append(generation_parts_note)
+
+        # Ask for what the model was actually offered. Told to "Select 200" out of a
+        # 5-line list, a small local curator answers with an empty array instead of the
+        # five it can honour (measured against the mlx_lm endpoint: "Select 12" of 5 ->
+        # '[]' at 2 output tokens, "Select 5" -> all five), which reads back as a valid
+        # run that matched nothing. A playlist can never be longer than the pool, so the
+        # count is clamped here rather than left for the model to refuse.
+        requested_picks = min(track_count, len(filtered_tracks))
+        generation_parts.append(f"\nSelect {requested_picks} tracks from this library:\n{track_list}")
 
         generation_prompt = "\n\n".join(generation_parts)
 
@@ -545,6 +1147,15 @@ def generate_playlist_stream(
         if not isinstance(track_selections, list):
             yield emit("error", {"message": "LLM returned invalid track selection format"})
             return
+
+        if not track_selections:
+            # The JSON was well formed and empty, so the curator refused the job rather
+            # than failing to answer - worth naming, since the run below "succeeds".
+            logger.warning(
+                "Curator selected nothing from %d candidates (asked for %d)",
+                len(filtered_tracks),
+                requested_picks,
+            )
 
         # Step 6: Match tracks
         yield emit("progress", {"step": "matching", "message": f"Matching {len(track_selections)} selections to library..."})
@@ -575,10 +1186,32 @@ def generate_playlist_stream(
                         track_reasons[track.rating_key] = reason
                     break
 
-        # Step 7: Generate narrative
+        # Step 7: Generate narrative. The liner note names 3-4 specific songs, so it is
+        # written from the tracks that actually made the playlist rather than from
+        # whatever the model named: an unmatched selection list otherwise advertises
+        # songs this playlist does not contain (a 0-track run described 'White Christmas'
+        # and 'Jingle Bell Rock' for a playlist with no tracks at all).
+        narrated = [
+            {
+                "artist": t.artist,
+                "title": t.title,
+                "album": t.album,
+                "reason": track_reasons.get(t.rating_key, ""),
+            }
+            for t in matched_tracks
+        ]
         yield emit("progress", {"step": "narrative", "message": "Writing playlist narrative..."})
 
-        playlist_title, narrative = generate_narrative(track_selections, llm_client, prompt or "")
+        if narrated:
+            playlist_title, narrative = generate_narrative(narrated, llm_client, prompt or "")
+        else:
+            logger.warning(
+                "Nothing matched the library (%d candidates, %d selections); "
+                "skipping the narrative model",
+                len(filtered_tracks),
+                len(track_selections),
+            )
+            playlist_title, narrative = f"{datetime.now().strftime('%b %Y')} Playlist", ""
         logger.info("Generated narrative: title='%s', narrative_len=%d", playlist_title, len(narrative))
 
         # Emit narrative event for frontend
@@ -606,6 +1239,9 @@ def generate_playlist_stream(
                 playlist_title=playlist_title,
                 narrative=narrative,
                 track_reasons=track_reasons,
+                matching_as_asked=ladder["asked"] if ladder else 0,
+                relaxed_tiers=ladder["relaxed"] if ladder else [],
+                relaxed_to=ladder["tier"] if ladder and ladder["relaxed"] else "",
             )
             logger.info("GenerateResponse built successfully with %d tracks", len(result.tracks))
         except Exception as e:
@@ -625,6 +1261,7 @@ def generate_playlist_stream(
 
         # Save result to history before emitting the final event
         result_id = None
+        reasoning_recorded = 0
         try:
             result_type = "seed_playlist" if seed_track else "prompt_playlist"
             # Title: always use the LLM-generated playlist title
@@ -650,6 +1287,28 @@ def generate_playlist_stream(
         except Exception as e:
             logger.warning("Failed to save result: %s", e)
 
+        # Curation memory: keep each pick's reason in the reasoning DB so later
+        # runs can replay the argument beside the candidate (reuse) and rank
+        # candidates by the mined tags (affinity). A memory-store failure must
+        # not fail the run: the playlist is already built and saved.
+        try:
+            reasoned = [
+                (t.rating_key, track_reasons[t.rating_key])
+                for t in matched_tracks
+                if track_reasons.get(t.rating_key)
+            ]
+            if reasoned:
+                reasoning_recorded = agent_reasoning.record_run(
+                    selections=reasoned,
+                    prompt=prompt or "",
+                    playlist_title=playlist_title,
+                    result_id=result_id or "",
+                    source="seed" if seed_track else "prompt",
+                )
+                logger.info("Stored curation reasoning for %d tracks", reasoning_recorded)
+        except Exception as e:
+            logger.warning("Failed to store curation reasoning: %s", e)
+
         # Emit small complete event with just metadata
         logger.info("Emitting complete event")
         complete_data = {
@@ -659,6 +1318,12 @@ def generate_playlist_stream(
             "playlist_title": result.playlist_title,
             "narrative": result.narrative,
             "track_reasons": result.track_reasons,
+            "matching_as_asked": result.matching_as_asked,
+            "relaxed_tiers": result.relaxed_tiers,
+            "relaxed_to": result.relaxed_to,
+            # Picks whose reason landed in the curation memory (replayable on
+            # the next run through GET /api/reasoning/status)
+            "reasoning_recorded": reasoning_recorded,
         }
         if result_id:
             complete_data["result_id"] = result_id

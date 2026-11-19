@@ -1,6 +1,6 @@
 """Tests for configuration loading."""
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import yaml
 
@@ -494,3 +494,87 @@ class TestLocalProviderConfig:
             config = load_config(config_file)
 
         assert config.llm.custom_context_window == 32768
+
+
+class TestSpotifyConfig:
+    """Tests for the optional Spotify playlist import section."""
+
+    def test_defaults_to_empty_section(self, tmp_path, monkeypatch):
+        """An install that configures no Spotify path still loads."""
+        for var in ["SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_PARQUET_DIR"]:
+            monkeypatch.delenv(var, raising=False)
+
+        config_file = tmp_path / "config.yaml"
+        config_data = {
+            "plex": {"url": "http://plex.local:32400", "token": "t"},
+            "llm": {"provider": "anthropic", "api_key": "k"},
+        }
+        config_file.write_text(yaml.dump(config_data))
+
+        with patch("backend.config.load_user_yaml_config", return_value={}):
+            config = load_config(config_file)
+
+        assert config.spotify.client_id == ""
+        assert config.spotify.client_secret == ""
+        assert config.spotify.parquet_dir == ""
+
+    def test_yaml_section_is_read(self, tmp_path, monkeypatch):
+        """The spotify: section fills AppConfig.spotify."""
+        for var in ["SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_PARQUET_DIR"]:
+            monkeypatch.delenv(var, raising=False)
+
+        config_file = tmp_path / "config.yaml"
+        config_data = {
+            "plex": {"url": "http://plex.local:32400", "token": "t"},
+            "llm": {"provider": "anthropic", "api_key": "k"},
+            "spotify": {"client_id": "yaml-id", "client_secret": "yaml-secret"},
+        }
+        config_file.write_text(yaml.dump(config_data))
+
+        with patch("backend.config.load_user_yaml_config", return_value={}):
+            config = load_config(config_file)
+
+        assert config.spotify.client_id == "yaml-id"
+        assert config.spotify.client_secret == "yaml-secret"
+        assert config.spotify.parquet_dir == ""
+
+    def test_env_vars_override_the_section(self, tmp_path, monkeypatch):
+        """Env wins per key, like every other section."""
+        monkeypatch.delenv("SPOTIFY_CLIENT_SECRET", raising=False)
+        monkeypatch.setenv("SPOTIFY_CLIENT_ID", "env-id")
+        monkeypatch.setenv("SPOTIFY_PARQUET_DIR", "/env/dump")
+
+        config_file = tmp_path / "config.yaml"
+        config_data = {
+            "plex": {"url": "http://plex.local:32400", "token": "t"},
+            "llm": {"provider": "anthropic", "api_key": "k"},
+            "spotify": {"client_id": "yaml-id", "client_secret": "yaml-secret"},
+        }
+        config_file.write_text(yaml.dump(config_data))
+
+        with patch("backend.config.load_user_yaml_config", return_value={}):
+            config = load_config(config_file)
+
+        assert config.spotify.client_id == "env-id"
+        assert config.spotify.client_secret == "yaml-secret"
+        assert config.spotify.parquet_dir == "/env/dump"
+
+    def test_credentials_win_over_the_dump(self):
+        """Both configured means the API path, so a caller never has to guess."""
+        from backend.models import SpotifyConfig
+        from backend.spotify_import import fetch_playlist
+
+        config = MagicMock()
+        config.spotify = SpotifyConfig(
+            client_id="id", client_secret="secret", parquet_dir="/somewhere/dump"
+        )
+        api = MagicMock(return_value={"name": "List", "owner": "", "tracks": [], "warnings": []})
+        dump = MagicMock()
+        with patch("backend.spotify_import.fetch_playlist_api", api), patch(
+            "backend.spotify_import.fetch_playlist_dump", dump
+        ):
+            body = fetch_playlist("spotify:playlist:abc123abc123abc123abc123", config)
+
+        assert body["source"] == "api"
+        assert body["name"] == "List"
+        dump.assert_not_called()

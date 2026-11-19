@@ -282,9 +282,16 @@ body {
 
 .home-cards {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, 1fr);
     gap: var(--spacing-md);
     margin-bottom: var(--spacing-xl);
+}
+
+/* Four features fit in one row once the viewport is wide enough */
+@media (min-width: 1100px) {
+    .home-cards {
+        grid-template-columns: repeat(4, 1fr);
+    }
 }
 
 .home-card {
@@ -1011,6 +1018,14 @@ textarea {
     margin: 0;
 }
 
+/* Which filter tiers the cache had to give up (see relax_filters_for_target) */
+.narrative-note {
+    color: var(--warning);
+    font-size: 13px;
+    line-height: 1.4;
+    margin: 0;
+}
+
 /* Results — Back Link */
 .results-back-link {
     display: inline-block;
@@ -1435,6 +1450,20 @@ input[type="number"]:focus:not(:focus-visible) {
 
 .library-stats p {
     margin-bottom: var(--spacing-xs);
+}
+
+/* Per-account stars + curation memory: same shape as the stats panel above it. */
+.memory-stats {
+    margin-top: var(--spacing-lg);
+    font-size: var(--font-size-sm);
+}
+
+.memory-stats p {
+    margin-bottom: var(--spacing-xs);
+}
+
+.memory-warning {
+    color: var(--warning);
 }
 
 /* Loading Overlay */
@@ -2119,6 +2148,52 @@ input[type="number"]:focus:not(:focus-visible) {
 
 .playlist-picker-select {
     width: 100%;
+}
+
+
+/* Playlist Ownership — which Plex account a saved playlist belongs to */
+.plex-user-container {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--spacing-sm);
+    margin-bottom: var(--spacing-md);
+}
+
+.plex-user-container.hidden {
+    display: none;
+}
+
+.plex-user-label {
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    white-space: nowrap;
+}
+
+.plex-user-select,
+.playlist-ownership-select {
+    width: auto;
+    min-width: 150px;
+}
+
+.playlist-ownership-select.hidden {
+    display: none;
+}
+
+.plex-user-hint {
+    margin: 0 0 var(--spacing-md);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+}
+
+.plex-user-hint.hidden {
+    display: none;
+}
+
+/* Rating-whose selector in the filter panel (Main account first, then the household) */
+.rating-user-select {
+    width: auto;
+    min-width: 150px;
 }
 
 
@@ -3287,6 +3362,22 @@ body.no-scroll {
     line-height: 1.3;
 }
 
+/* Plex playlist this history row was saved as */
+.history-card-playlist {
+    font-size: 0.75rem;
+    color: var(--accent);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.3;
+    cursor: pointer;
+}
+
+.history-card-playlist-owner::before {
+    content: " \00b7 ";
+    color: var(--text-muted);
+}
+
 .history-card-time {
     font-size: 0.75rem;
     color: var(--text-muted);
@@ -3646,5 +3737,209 @@ body.no-scroll {
     }
     .setup-step-body {
         padding: 0 var(--spacing-sm) var(--spacing-sm);
+    }
+}
+
+/* =============================================================================
+   SPOTIFY IMPORT VIEW
+   ============================================================================= */
+
+.import-step-content {
+    max-width: 640px;
+    margin: 0 auto;
+}
+
+/* The run and the wish list read their rows at full width */
+.import-step-content:has(#imp-step-results.active) {
+    max-width: 760px;
+}
+
+.import-step-content:has(#imp-step-wishlist.active) {
+    max-width: 760px;
+}
+
+.imp-panel {
+    display: none;
+}
+
+.imp-panel.active {
+    display: block;
+}
+
+/* "Which playlist did we read, and how" line above the row lists */
+.spotify-import-summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--spacing-xs) var(--spacing-md);
+    margin-bottom: var(--spacing-md);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+}
+
+.spotify-import-summary strong {
+    color: var(--text-primary);
+}
+
+.spotify-summary-stat {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+/* Rows the fetch could not use ("12 episodes skipped", dump warnings) */
+.spotify-import-warnings {
+    margin-bottom: var(--spacing-md);
+    color: var(--warning);
+    font-size: var(--font-size-sm);
+}
+
+.spotify-import-warnings p {
+    margin-bottom: var(--spacing-xs);
+}
+
+/* Matched / missing / wish rows */
+.spotify-import-list {
+    margin-bottom: var(--spacing-md);
+}
+
+.spotify-song-row {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    padding: var(--spacing-xs) var(--spacing-sm);
+    margin-bottom: 2px;
+    font-size: var(--font-size-sm);
+}
+
+.spotify-song-row--empty {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    padding: var(--spacing-xs);
+}
+
+.spotify-row-position {
+    color: var(--text-muted);
+    min-width: 20px;
+    font-variant-numeric: tabular-nums;
+}
+
+.spotify-row-title {
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.spotify-row-artist {
+    color: var(--text-secondary);
+}
+
+.spotify-row-album {
+    color: var(--text-muted);
+}
+
+.spotify-row-duration {
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.spotify-row-link {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.spotify-row-link:hover {
+    text-decoration: underline;
+}
+
+/* How a matched row landed: exact / version / album / search */
+.spotify-row-tag {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 2px var(--spacing-xs);
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.spotify-row-tag--exact {
+    border-color: var(--success);
+    color: var(--success);
+}
+
+.spotify-row-tag--version,
+.spotify-row-tag--album {
+    border-color: var(--warning);
+    color: var(--warning);
+}
+
+.spotify-row-tag--search {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+/* The wish list's per-playlist header rows */
+.spotify-wishlist-summary {
+    margin-bottom: var(--spacing-md);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+}
+
+.spotify-wishlist-playlist {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    margin-bottom: var(--spacing-xs);
+    font-size: var(--font-size-sm);
+}
+
+.spotify-wishlist-playlist-count {
+    color: var(--accent);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.spotify-wishlist-empty {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    margin-bottom: var(--spacing-md);
+}
+
+/* Outcome of an import: what got written to Plex, and what stayed a wish */
+.spotify-import-result {
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    margin-bottom: var(--spacing-md);
+}
+
+.spotify-import-result h2 {
+    font-size: var(--font-size-xl);
+    margin-bottom: var(--spacing-sm);
+}
+
+.spotify-import-result strong {
+    color: var(--text-primary);
+}
+
+.spotify-import-result--failed {
+    color: var(--warning);
+}
+
+.spotify-result-line {
+    margin-bottom: var(--spacing-xs);
+    font-size: var(--font-size-sm);
+}
+
+.import-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: var(--spacing-sm);
+    margin-top: var(--spacing-md);
+}
+
+@media (max-width: 600px) {
+    .spotify-song-row {
+        gap: var(--spacing-xs);
     }
 }

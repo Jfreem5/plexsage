@@ -428,3 +428,317 @@ class TestTrackAnalysisCache:
 
         assert [d.id for d in second.dimensions] == ["mood", "era"]
         assert second.dimensions[0].label == "Melancholy, bittersweet mood"
+
+
+class TestPromptEvidence:
+    """Analysis reports which prompt phrases produced each filter."""
+
+    def test_local_classification_reports_hints(self, mocker):
+        """Zero-token path should still explain itself."""
+        from backend.analyzer import analyze_prompt
+
+        with patch("backend.analyzer.get_plex_client") as mock_plex:
+            mock_plex.return_value.get_library_stats.return_value = _plex_stats(
+                [{"name": "Alternative", "count": 100}, {"name": "Rock", "count": 200}],
+                [{"name": "1990s", "count": 150}],
+            )
+            result = analyze_prompt("melancholy 90s alternative")
+
+        assert result.method == "rules"
+        hints = {h.hint: h.matches for h in result.matched_hints}
+        assert hints, "a rules-based match must report the phrase that matched"
+        for matches in hints.values():
+            for genre in matches:
+                assert genre in {"Alternative", "Rock"}
+
+    def test_llm_path_keeps_hint_evidence(self, mocker):
+        """The LLM fallback should return the same evidence fields."""
+        from backend.analyzer import analyze_prompt
+        from backend.llm_client import LLMResponse
+
+        mock_response = LLMResponse(
+            content=json.dumps(
+                {
+                    "genres": ["Alternative"],
+                    "decades": ["1990s"],
+                    "reasoning": "The request names 90s alternative directly.",
+                    "hint_matches": [
+                        {"hint": "90s", "matches": ["1990s"]},
+                        {"hint": "alternative", "matches": ["Alternative", "Ghost Genre"]},
+                    ],
+                    "excluded_genres": ["Rock", "Not Available"],
+                }
+            ),
+            input_tokens=120,
+            output_tokens=60,
+            model="test-model",
+        )
+
+        client = MagicMock()
+        client.analyze.return_value = mock_response
+        client.parse_json_response.return_value = json.loads(mock_response.content)
+
+        with patch("backend.analyzer.classify_prompt", return_value=LOW_CONFIDENCE), patch(
+            "backend.analyzer.get_llm_client",
+            return_value=client,
+        ), patch("backend.analyzer.get_plex_client") as mock_plex:
+            mock_plex.return_value.get_library_stats.return_value = _plex_stats(
+                [{"name": "Alternative", "count": 100}, {"name": "Rock", "count": 200}],
+                [{"name": "1990s", "count": 150}],
+            )
+
+            result = analyze_prompt("melancholy 90s alternative")
+
+        assert result.method == "llm"
+        hints = {h.hint: h.matches for h in result.matched_hints}
+        assert hints["alternative"] == ["Alternative"], "invented genres are dropped"
+        assert result.excluded_genres == ["Rock"]
+
+
+class TestDimensionDetail:
+    """Seed-track analysis is deeper and the cache knows the prompt version."""
+
+    @pytest.fixture(autouse=True)
+    def _temp_library_db(self, tmp_path, monkeypatch):
+        from backend import library_cache
+
+        monkeypatch.setattr(library_cache, "DB_PATH", tmp_path / "analyzer.db")
+        monkeypatch.setattr(library_cache, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(library_cache, "_schema_initialized", False)
+        yield
+
+    def _track(self):
+        from backend.models import Track
+
+        return Track(
+            rating_key="1",
+            title="Fake Plastic Trees",
+            artist="Radiohead",
+            album="The Bends",
+            duration_ms=290000,
+            year=1995,
+            genres=["Alternative", "Rock"],
+        )
+
+    def _mock_llm(self, dimensions=None):
+        from backend.llm_client import LLMResponse
+
+        if dimensions is None:
+            dimensions = [
+                {"id": "mood", "label": "M", "description": "d", "category": "mood"},
+                {"id": "tempo", "label": "T", "description": "d", "category": "tempo"},
+            ]
+        response = LLMResponse(
+            content=json.dumps({"dimensions": dimensions}),
+            input_tokens=100,
+            output_tokens=80,
+            model="analysis-model",
+        )
+        client = MagicMock()
+        client.config.model_analysis = "analysis-model"
+        client.analyze.return_value = response
+        client.parse_json_response.return_value = json.loads(response.content)
+        return client
+
+    def test_categories_are_kept(self):
+        from backend.analyzer import analyze_track
+
+        dims = [
+            {"id": "mood", "label": "M", "description": "d", "category": "mood"},
+            {"id": "tempo", "label": "T", "description": "d", "category": "tempo"},
+        ]
+        client = self._mock_llm(dims)
+        with patch("backend.analyzer.get_llm_client", return_value=client):
+            result = analyze_track(self._track())
+
+        assert result.dimensions[0].category == "mood"
+
+    def test_surplus_dimensions_are_capped(self):
+        """More dimensions than the cap must not overflow into the response."""
+        from backend.analyzer import DIMENSION_MAX, analyze_track
+
+        dims = [
+            {"id": f"d{i}", "label": f"L{i}", "description": "d", "category": "mood"}
+            for i in range(DIMENSION_MAX + 5)
+        ]
+        client = self._mock_llm(dims)
+        with patch("backend.analyzer.get_llm_client", return_value=client):
+            result = analyze_track(self._track())
+
+        assert len(result.dimensions) == DIMENSION_MAX
+
+    def test_duplicate_ids_stay_distinct(self):
+        from backend.analyzer import analyze_track
+
+        dims = [
+            {"id": "mood", "label": "One", "description": "d"},
+            {"id": "mood", "label": "Two", "description": "d"},
+        ]
+        client = self._mock_llm(dims)
+        with patch("backend.analyzer.get_llm_client", return_value=client):
+            result = analyze_track(self._track())
+
+        assert [d.id for d in result.dimensions] == ["mood", "mood_2"]
+
+    def test_prompt_version_invalidates_the_cache(self, monkeypatch):
+        """Raising the analysis-prompt version retires cached entries."""
+        from backend.analyzer import analyze_track
+
+        client = self._mock_llm()
+        with patch("backend.analyzer.get_llm_client", return_value=client):
+            analyze_track(self._track())
+            monkeypatch.setattr("backend.analyzer.DIMENSION_PROMPT_VERSION", 99)
+            result = analyze_track(self._track())
+
+        assert client.analyze.call_count == 2
+        assert result.cached is False
+
+
+class TestPromptFacetPlumbing:
+    """The new hard filters and library measurements travel end to end."""
+
+    @pytest.fixture
+    def facet_library(self, monkeypatch):
+        monkeypatch.setattr("backend.library_cache.has_cached_tracks", lambda: True)
+        monkeypatch.setattr(
+            "backend.library_cache.get_cached_artists",
+            lambda limit=0: [{"name": "Metallica", "count": 30}, {"name": "Yes", "count": 9}],
+        )
+        monkeypatch.setattr(
+            "backend.library_cache.get_cached_play_stats",
+            lambda: {
+                "total": 6,
+                "unheard": 3,
+                "played": 3,
+                "plays": [0, 0, 0, 2, 30],
+                "years": [1985, 2011],
+            },
+        )
+        monkeypatch.setattr(
+            "backend.library_cache.get_cached_duration_stats",
+            lambda: {"min_ms": 60_000, "p25_ms": 120_000, "p50_ms": 200_000, "p75_ms": 260_000, "max_ms": 400_000},
+        )
+
+    def _stats(self):
+        return {
+            "genres": [{"name": "Rock", "count": 400}, {"name": "Metal", "count": 90}],
+            "decades": [{"name": "1980s", "count": 300}, {"name": "1990s", "count": 210}],
+        }
+
+    def test_measurements_describe_the_local_library(self, mocker, facet_library):
+        """Play counts, unheard total and year span come from the cache."""
+        from backend.analyzer import analyze_prompt
+
+        with patch("backend.analyzer.get_plex_client") as mock_plex:
+            mock_plex.return_value.get_library_stats.return_value = self._stats()
+            result = analyze_prompt("deep cuts from the eighties")
+
+        assert result.available_plays == [0, 0, 0, 2, 30]
+        assert result.unheard_tracks == 3
+        assert result.year_span == [1985, 2011]
+        assert [a.name for a in result.available_artists] == ["Metallica", "Yes"]
+
+    def test_local_path_forwards_familiarity_and_bans(self, mocker, facet_library):
+        from backend.analyzer import analyze_prompt
+
+        with patch("backend.analyzer.get_plex_client") as mock_plex:
+            mock_plex.return_value.get_library_stats.return_value = self._stats()
+            result = analyze_prompt("hidden gems, studio albums only, no 90s metal")
+
+        assert result.suggested_unheard_only is True
+        assert result.suggested_exclude_compilations is True
+        assert result.suggested_exclude_decades == ["1990s"]
+        assert result.suggested_excluded_genres == ["Metal"]
+        assert "1990s" not in result.suggested_decades
+        assert result.method == "rules"
+        assert result.token_count == 0
+
+    def test_local_path_forwards_a_year_window(self, mocker, facet_library):
+        from backend.analyzer import analyze_prompt
+
+        with patch("backend.analyzer.get_plex_client") as mock_plex:
+            mock_plex.return_value.get_library_stats.return_value = self._stats()
+            result = analyze_prompt("rock recorded after 2015")
+
+        assert result.suggested_min_year == 2015
+        assert result.suggested_max_year == 0
+
+    def test_play_facets_stay_unknown_on_the_plex_path(self, mocker):
+        """An empty cache must not invent familiarity numbers."""
+        from backend.analyzer import analyze_prompt
+
+        with patch("backend.library_cache.has_cached_tracks", return_value=False):
+            with patch("backend.analyzer.get_plex_client") as mock_plex:
+                mock_plex.return_value.get_library_stats.return_value = self._stats()
+                mock_plex.return_value.get_all_artists.return_value = []
+                mock_plex.return_value.get_duration_stats.return_value = {}
+                result = analyze_prompt("hidden gems")
+
+        assert result.unheard_tracks == -1
+        assert result.available_plays == []
+        assert result.year_span == []
+
+    def test_llm_path_coerces_the_new_facets(self, mocker, facet_library):
+        """Inverted, implausible and off-library values are repaired."""
+        from backend.analyzer import analyze_prompt
+        from backend.llm_client import LLMResponse
+
+        payload = {
+            "genres": ["Rock"],
+            "decades": [],
+            "artists": ["metallica", "NotInLibrary"],
+            "exclude_artists": ["Metallica", "Ghost"],
+            "exclude_decades": ["1980s"],
+            "min_year": 30000,
+            "max_year": "1980",
+            "min_plays": 9,
+            "max_plays": 2,
+            "unheard_only": "yes",
+            "exclude_compilations": "true",
+            "style_cues": ["  moody  ", "", "x" * 400],
+            "reasoning": "wide open",
+        }
+        response = LLMResponse(
+            content=json.dumps(payload), input_tokens=120, output_tokens=60, model="test-model"
+        )
+
+        with patch("backend.analyzer.classify_prompt", return_value=LOW_CONFIDENCE):
+            with patch("backend.analyzer.get_plex_client") as mock_plex:
+                mock_plex.return_value.get_library_stats.return_value = self._stats()
+                with patch("backend.analyzer.get_llm_client") as mock_llm:
+                    mock_llm.return_value.analyze.return_value = response
+                    mock_llm.return_value.parse_json_response.return_value = payload
+
+                    result = analyze_prompt("wide open request")
+
+        assert result.suggested_min_year == 0
+        assert result.suggested_max_year == 1980
+        assert result.suggested_min_plays == 0
+        assert result.suggested_max_plays == 0
+        assert result.suggested_unheard_only is True
+        assert result.suggested_exclude_compilations is True
+        assert result.suggested_exclude_artists == ["Metallica"]
+        assert result.suggested_artists == []
+        assert result.style_cues[0] == "moody"
+        assert len(result.style_cues) == 2
+        assert len(result.style_cues[1]) == 120
+        assert result.method == "llm"
+        assert result.token_count == 180
+
+    def test_style_cues_do_not_become_filters(self, mocker, facet_library):
+        """Soft cues steer the curator prompt; they must not narrow metadata."""
+        from backend.analyzer import analyze_prompt
+
+        with patch("backend.analyzer.get_plex_client") as mock_plex:
+            mock_plex.return_value.get_library_stats.return_value = self._stats()
+            result = analyze_prompt("dreamy and atmospheric rock")
+
+        assert result.style_cues == ["dreamy and atmospheric"]
+        assert not any(
+            "dreamy" in genre or "atmospheric" in genre for genre in result.suggested_genres
+        )
+        assert result.suggested_decades == []
+        assert result.suggested_exclude_decades == []
+        assert result.suggested_unheard_only is False
+        assert result.suggested_exclude_compilations is False
+        assert result.token_count == 0

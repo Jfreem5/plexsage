@@ -97,6 +97,9 @@ CUSTOM_CONTEXT_WINDOW=4096
 - **Two-model strategy**: Smart model for analysis, cheap model for generation
 - **Fuzzy track matching**: Use rapidfuzz (threshold ~60) to match LLM responses to library
 - **Live version filtering**: Exclude tracks with "live", "concert", dates in title/album
+- **Playlist ownership**: playlists for other users are written by impersonating them
+  (`server.switchUser`, connections cached 15 min); Plex has no user-to-user playlist
+  share, so `copy_to` creates a separate playlist inside each account
 
 ## LLM Models
 
@@ -129,6 +132,8 @@ Option: `smart_generation: true` uses analysis model for both (higher quality, ~
 <!-- MANUAL ADDITIONS END -->
 
 ## Recent Changes
+- Playlist ownership: Added saving/updating playlists for other Plex users (`user` + `copy_to`
+  on the playlist endpoints, `GET /api/plex/users`, "Playlist for" picker) — no new dependencies
 - 006-recommend-album: Added Python 3.11+ (backend), Vanilla JavaScript ES6+ (frontend) + FastAPI, python-plexapi, httpx, Pydantic, anthropic/openai/google-genai SDKs
 - 005-instant-queue: Added Python 3.11+ (backend), Vanilla JavaScript ES6+ (frontend) + FastAPI, python-plexapi (v4.18.0), Pydantic, httpx
 - 004-curator-narrative: Added Python 3.11+ (backend), Vanilla JavaScript ES6+ (frontend) + FastAPI, python-plexapi, google-genai, anthropic, openai, pydantic, rapidfuzz
